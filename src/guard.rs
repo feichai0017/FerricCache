@@ -54,6 +54,7 @@ impl<'a, T> GuardO<'a, T> {
                 }
                 _ => {
                     let ptr = unsafe { NonNull::new_unchecked(bm.to_ptr(pid) as *mut T) };
+                    bm.stats_inc_read();
                     return Ok(Self {
                         bm,
                         pid,

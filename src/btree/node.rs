@@ -473,7 +473,11 @@ fn prefix_cmp(key: &[u8], prefix: &[u8]) -> i32 {
     if let Some(c) = cmp {
         return c.signum();
     }
-    (key.len() as i32 - prefix.len() as i32).signum()
+    if key.len() >= prefix.len() {
+        0
+    } else {
+        -1
+    }
 }
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {

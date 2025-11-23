@@ -293,6 +293,8 @@ impl BTree {
                     }
                 }
                 left.ptr().hdr.upper_inner = leaf.ptr().hdr.upper_inner;
+                left.ptr().recompute_fences();
+                left.ptr().make_hint();
                 parent_x.ptr().remove_slot((pos - 1) as usize);
                 self.bm.free_page(leaf.pid);
                 self.handle_parent_underflow(parent_x, path)?;
@@ -312,6 +314,8 @@ impl BTree {
                     }
                 }
                 left.ptr().hdr.upper_inner = right.ptr().hdr.upper_inner;
+                left.ptr().recompute_fences();
+                left.ptr().make_hint();
                 // remove separator from parent
                 if pos < parent_x.ptr().hdr.count {
                     parent_x.ptr().remove_slot(pos as usize);
@@ -536,7 +540,9 @@ impl BTree {
         let next = node.ptr().hdr.upper_inner;
         node.ptr().hdr = super::node::BTreeNodeHeader::new(true);
         node.ptr().hdr.upper_inner = next;
-        node.ptr().set_fences(&[], &[]);
+        let lower = entries.first().map(|e| e.0.clone()).unwrap_or_default();
+        let upper = entries.last().map(|e| e.0.clone()).unwrap_or_default();
+        node.ptr().set_fences(&lower, &upper);
         for (k, p) in entries.iter() {
             if !node.ptr().has_space_for(k.len(), p.len()) {
                 return false;
@@ -566,14 +572,14 @@ impl BTree {
             });
         }
         let next = node.ptr().hdr.upper_inner;
-        let _left_lower = left_entries.first().unwrap().0.clone();
-        let _left_upper = left_entries.last().unwrap().0.clone();
-        let _right_lower = sep_key.clone();
-        let _right_upper = right_entries.last().unwrap().0.clone();
+        let left_lower = left_entries.first().unwrap().0.clone();
+        let left_upper = left_entries.last().unwrap().0.clone();
+        let right_lower = sep_key.clone();
+        let right_upper = right_entries.last().unwrap().0.clone();
         // rebuild left
         node.ptr().hdr = super::node::BTreeNodeHeader::new(true);
         node.ptr().hdr.upper_inner = new_pid;
-        node.ptr().set_fences(&[], &[]);
+        node.ptr().set_fences(&left_lower, &left_upper);
         for (k, p) in left_entries.iter() {
             let ok = node.ptr().insert_in_page(k, p);
             if !ok {
@@ -583,7 +589,7 @@ impl BTree {
         // rebuild right
         let mut new_node = GuardX::<BTreeNode>::new_from_pid(self.bm.as_ref(), new_pid);
         new_node.ptr().hdr.upper_inner = next;
-        new_node.ptr().set_fences(&[], &[]);
+        new_node.ptr().set_fences(&right_lower, &right_upper);
         for (k, p) in right_entries.iter() {
             let ok = new_node.ptr().insert_in_page(k, p);
             if !ok {
@@ -593,5 +599,37 @@ impl BTree {
         node.ptr().make_hint();
         new_node.ptr().make_hint();
         Ok((sep_key, new_pid))
+    }
+}
+
+/// Test-only helpers to introspect leaf fence/prefix state.
+#[cfg(test)]
+impl BTree {
+    pub fn debug_leaves(&self) -> Result<Vec<(u64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, u16)>> {
+        let mut out = Vec::new();
+        let mut node = GuardO::<BTreeNode>::new(self.bm.as_ref(), self.root_pid.load(std::sync::atomic::Ordering::Acquire))?;
+        while !node.ptr().hdr.is_leaf {
+            let child_pid = node.ptr().child_pid(0)?;
+            node = GuardO::<BTreeNode>::new(self.bm.as_ref(), child_pid)?;
+        }
+        loop {
+            if node.ptr().hdr.count > 0 {
+                let first = node.ptr().reconstruct_key(0);
+                let last = node.ptr().reconstruct_key((node.ptr().hdr.count - 1) as usize);
+                out.push((
+                    node.pid,
+                    node.ptr().lower_fence().to_vec(),
+                    node.ptr().upper_fence().to_vec(),
+                    first,
+                    last,
+                    node.ptr().hdr.prefix_len,
+                ));
+            }
+            if node.ptr().hdr.upper_inner == u64::MAX {
+                break;
+            }
+            node = GuardO::<BTreeNode>::new(self.bm.as_ref(), node.ptr().hdr.upper_inner)?;
+        }
+        Ok(out)
     }
 }

@@ -36,19 +36,19 @@
 ```mermaid
 flowchart LR
     subgraph Memory
-        PS[PageState<br/>Atomic state+version]
-        RS[ResidentPageSet<br/>Clock iterator]
-        MR[MmapRegion<br/>virtual pages]
+        PS["PageState\nAtomic state+version"]
+        RS["ResidentPageSet\nClock iterator"]
+        MR["MmapRegion\nvirtual pages"]
     end
     subgraph IO
-        SIO[Sync IO<br/>pread/pwrite]
-        LIO[Libaio (batched)<br/>async planned]
-        EX[exmap (future)]
+        SIO["Sync IO\npread/pwrite"]
+        LIO["Libaio (batched)\nasync planned"]
+        EX["exmap (future)"]
     end
-    CFG[Config (env)]
-    BM[BufferManager<br/>fix/unfix, eviction, stats]
-    BT[B+Tree<br/>guards, split/merge]
-    BENCH[Benches<br/>random-read, TPCC (planned)]
+    CFG["Config (env)"]
+    BM["BufferManager\nfix/unfix, eviction, stats"]
+    BT["B+Tree\nguards, split/merge"]
+    BENCH["Benches\nrandom-read, TPCC (planned)"]
 
     CFG --> BM
     MR --> BM
@@ -71,7 +71,7 @@ flowchart TD
     batch --> submit{Submit write}
     submit -->|BGWRITE on| queue[Enqueue BGWRITE]
     submit -->|BGWRITE off| sync[Sync write_pages]
-    queue --> worker[BG worker\n(libaio async)]
+    queue --> worker["BG worker\n(libaio async)"]
     worker --> completion[Completion / error]
     completion --> clean[Clear dirty, stats++]
     sync --> clean

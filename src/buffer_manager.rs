@@ -2,8 +2,9 @@ use crate::config::Config;
 use crate::memory::{
     page::Page,
     page_state::{state, PageState},
-    MmapRegion,
     ResidentPageSet,
+    VirtualRegion,
+    create_region,
     PAGE_SIZE,
 };
 use crate::Result;
@@ -42,7 +43,7 @@ pub struct BufferManager {
     pub read_count: AtomicU64,
     pub write_count: AtomicU64,
     /// Virtual memory region (mmap or exmap).
-    pub virt_region: MmapRegion,
+    pub virt_region: VirtualRegion,
     /// Per-page state array.
     pub page_state: Vec<PageState>,
     /// Tracks currently resident pages for eviction.
@@ -105,9 +106,11 @@ impl BufferManager {
         #[cfg(not(feature = "libaio"))]
         let io: Arc<dyn PageIo> = SyncFileIo::open_with_len(&config.block_path, virt_size)?;
 
-        let virt_region = MmapRegion::new(
-            usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?,
-        )?;
+        let page_count = usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?;
+        let (virt_region, used_exmap) = create_region(page_count, config.use_exmap)?;
+        if config.use_exmap && !used_exmap {
+            eprintln!("exmap requested but unavailable; falling back to mmap");
+        }
         let mut page_state = Vec::with_capacity(virt_count as usize);
         for _ in 0..virt_count {
             let ps = PageState::new();
@@ -273,6 +276,7 @@ impl BufferManager {
                 }
                 _ => {
                     if ps.try_lock_s(v) {
+                        self.stats_inc_read();
                         return self.to_ptr(pid);
                     }
                 }
@@ -296,7 +300,6 @@ impl BufferManager {
         self.read_page(pid).expect("read_page failed");
         self.resident_set.insert(pid);
         self.read_count.fetch_add(1, Ordering::SeqCst);
-        self.stats_inc_read();
         self.stats_inc_fault();
     }
 
@@ -403,6 +406,9 @@ impl BufferManager {
                         unsafe { (*self.to_ptr(pid)).dirty = false; }
                         self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
+                        // release the eviction-held shared lock immediately on sync fallback
+                        ps.unlock_s();
+                        self.try_mark_if_unlocked(pid);
                     }
                 }
             } else {
@@ -428,9 +434,26 @@ impl BufferManager {
             }
         }
 
-        // Wait for any inflight background writes (VMCache-style sync wait after submit).
+        // For async BGWRITE we don't block; completions will be reaped and marked for later eviction.
         if self.bg_write {
-            self.wait_for_bg_all();
+            // avoid Phase 3 upgrade; background completions will unlock and allow future eviction passes
+            to_evict.retain(|&pid| {
+                let ps = self.page_state_ref(pid);
+                let v = ps.load();
+                PageState::state(v) == state::MARKED && ps.try_lock_x(v)
+            });
+            // Phase 4: free pages (madvise/dontneed) and remove from resident set
+            for pid in to_evict {
+                let removed = self.resident_set.remove(pid);
+                debug_assert!(removed);
+                self.page_state_ref(pid).unlock_x_evicted();
+                self.phys_used_count.fetch_sub(1, Ordering::SeqCst);
+                self.stats_inc_evict();
+                unsafe {
+                    libc::madvise(self.to_ptr(pid) as *mut libc::c_void, PAGE_SIZE, libc::MADV_DONTNEED);
+                }
+            }
+            return;
         }
 
         // Phase 2: lock clean candidates (currently MARKED)
@@ -732,25 +755,25 @@ impl BufferManager {
         })
     }
 
-    fn stats_inc_read(&self) {
+    pub(crate) fn stats_inc_read(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
             PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Read);
         }
     }
 
-    fn stats_inc_write(&self) {
+    pub(crate) fn stats_inc_write(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
             PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Write);
         }
     }
 
-    fn stats_inc_fault(&self) {
+    pub(crate) fn stats_inc_fault(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
             PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Fault);
         }
     }
 
-    fn stats_inc_evict(&self) {
+    pub(crate) fn stats_inc_evict(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
             PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Evict);
         }
@@ -799,18 +822,7 @@ impl BufferManager {
         for pid in keys {
             if let Some(rx) = inflight.get(&pid) {
                 let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
-                match res {
-                    Ok(()) => {
-                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
-                        unsafe { (*self.to_ptr(pid)).dirty = false; }
-                        self.write_count.fetch_add(1, Ordering::SeqCst);
-                        self.stats_inc_write();
-                    }
-                    Err(_e) => {
-                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
-                        let _ = self.io.write_page(pid, self.to_ptr(pid));
-                    }
-                }
+                self.handle_bg_completion(pid, res);
                 finished.push(pid);
             }
         }
@@ -827,16 +839,8 @@ impl BufferManager {
         for pid in keys {
             if let Some(rx) = inflight.get(&pid) {
                 match rx.try_recv() {
-                    Ok(Ok(())) => {
-                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
-                        unsafe { (*self.to_ptr(pid)).dirty = false; }
-                        self.write_count.fetch_add(1, Ordering::SeqCst);
-                        self.stats_inc_write();
-                        finished.push(pid);
-                    }
-                    Ok(Err(_e)) => {
-                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
-                        let _ = self.io.write_page(pid, self.to_ptr(pid));
+                    Ok(res) => {
+                        self.handle_bg_completion(pid, res);
                         finished.push(pid);
                     }
                     Err(TryRecvError::Empty) => {}
@@ -849,6 +853,43 @@ impl BufferManager {
         }
         for pid in finished {
             inflight.remove(&pid);
+        }
+    }
+
+    /// Apply completion bookkeeping for a background write and best-effort unpin for eviction.
+    fn handle_bg_completion(&self, pid: u64, res: FerricResult<()>) {
+        match res {
+            Ok(()) => {
+                self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
+                unsafe { (*self.to_ptr(pid)).dirty = false; }
+                self.write_count.fetch_add(1, Ordering::SeqCst);
+                self.stats_inc_write();
+            }
+            Err(_e) => {
+                self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
+                let _ = self.io.write_page(pid, self.to_ptr(pid));
+            }
+        }
+        self.release_bg_shared_lock(pid);
+        self.try_mark_if_unlocked(pid);
+    }
+
+    /// Release the S-lock held by eviction for bgwrite, if still present.
+    fn release_bg_shared_lock(&self, pid: u64) {
+        let ps = self.page_state_ref(pid);
+        let v = ps.load();
+        let s = PageState::state(v);
+        if s > 0 && s < state::LOCKED {
+            ps.unlock_s();
+        }
+    }
+
+    /// Best-effort remark a clean page so a subsequent eviction pass can reclaim it quickly.
+    fn try_mark_if_unlocked(&self, pid: u64) {
+        let ps = self.page_state_ref(pid);
+        let v = ps.load();
+        if PageState::state(v) == state::UNLOCKED {
+            let _ = ps.try_mark(v);
         }
     }
 }
