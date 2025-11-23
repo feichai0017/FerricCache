@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Page lock state bits stored in the top 8 bits of the 64-bit word.
-#[allow(dead_code)]
 pub mod state {
     pub const UNLOCKED: u8 = 0;
     pub const MAX_SHARED: u8 = 252;

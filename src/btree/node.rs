@@ -81,7 +81,12 @@ pub struct BTreeNode {
 
 impl BTreeNode {
     pub const fn max_kv_size() -> usize {
-        (PAGE_SIZE - std::mem::size_of::<BTreeNodeHeader>() - 2 * std::mem::size_of::<Slot>()) / 4
+        (PAGE_DATA_SIZE - 2 * std::mem::size_of::<Slot>()) / 4
+    }
+
+    #[inline]
+    fn header_bytes() -> usize {
+        std::mem::size_of::<BTreeNodeHeader>()
     }
 
     fn slots_ptr(&self) -> *const Slot {
@@ -107,11 +112,14 @@ impl BTreeNode {
     }
 
     pub fn free_space(&self) -> usize {
-        self.hdr.data_offset as usize - (self.slot_area_len())
+        let base = Self::header_bytes() + self.slot_area_len();
+        self.hdr.data_offset.saturating_sub(base as u16) as usize
     }
 
     pub fn free_space_after_compaction(&self) -> usize {
-        PAGE_SIZE - self.slot_area_len() - self.hdr.space_used as usize
+        PAGE_DATA_SIZE
+            .saturating_sub(self.slot_area_len())
+            .saturating_sub(self.hdr.space_used as usize)
     }
 
     pub fn has_space_for(&self, key_len: usize, payload_len: usize) -> bool {
@@ -166,6 +174,36 @@ impl BTreeNode {
         let mut arr = [0u8; 8];
         arr.copy_from_slice(&payload[..8]);
         u64::from_le_bytes(arr)
+    }
+
+    /// Return the child pointer at logical index (0-based).
+    /// Index 0 is the leftmost child stored in `upper_inner`; other children live in slots.
+    pub fn child_at(&self, idx: usize) -> u64 {
+        if idx == 0 {
+            self.hdr.upper_inner
+        } else {
+            self.get_child(idx - 1)
+        }
+    }
+
+    /// Return child pointer, validating it is initialized.
+    pub fn child_pid(&self, idx: usize) -> Result<u64, &'static str> {
+        let pid = self.child_at(idx);
+        if pid == u64::MAX {
+            Err("invalid child pid")
+        } else {
+            Ok(pid)
+        }
+    }
+
+    /// Return all child PIDs in logical order (len = count+1).
+    pub fn children(&self) -> Vec<u64> {
+        let mut v = Vec::with_capacity(self.hdr.count as usize + 1);
+        v.push(self.hdr.upper_inner);
+        for i in 0..self.hdr.count as usize {
+            v.push(self.get_child(i));
+        }
+        v
     }
 
     pub fn get_prefix(&self) -> &[u8] {
@@ -366,12 +404,15 @@ impl BTreeNode {
     }
 
     /// Store key/payload at slot position, shifting existing slots.
-    pub fn insert_in_page(&mut self, key: &[u8], payload: &[u8]) {
+    /// Returns false if there still isn't enough space even after compaction.
+    pub fn insert_in_page(&mut self, key: &[u8], payload: &[u8]) -> bool {
         let needed = self.space_needed(key.len(), payload.len());
         if needed > self.free_space() {
             self.compactify();
         }
-        assert!(needed <= self.free_space_after_compaction());
+        if needed > self.free_space_after_compaction() {
+            return false;
+        }
         let (slot_id_u16, _) = self.lower_bound(key);
         let slot_id = slot_id_u16 as usize;
         if slot_id < self.hdr.count as usize {
@@ -384,9 +425,15 @@ impl BTreeNode {
                 );
             }
         }
+        // Clear the slot we're about to write to avoid carrying stale bytes.
+        unsafe {
+            let slot_ptr = self.slots_ptr_mut().add(slot_id);
+            std::ptr::write_bytes(slot_ptr, 0, 1);
+        }
         self.hdr.count += 1;
         self.store_key_value(slot_id, key, payload);
         self.make_hint();
+        true
     }
 
     fn store_key_value(&mut self, slot_id: usize, key: &[u8], payload: &[u8]) {

@@ -2,6 +2,7 @@ use ferric_cache::buffer_manager::BufferManager;
 use ferric_cache::btree::tree::BTree;
 use ferric_cache::config::Config;
 use ferric_cache::thread_local::set_worker_id;
+use std::env;
 use rand::distributions::{Distribution, Uniform};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -11,9 +12,16 @@ use std::time::{Duration, Instant};
 
 fn main() -> ferric_cache::Result<()> {
     let mut cfg = Config::from_env();
-    // For microbenchmark allow overriding via env; otherwise default to smaller footprint.
-    if cfg.data_size == Config::default().data_size {
-        cfg.data_size = 1_000_000; // number of keys
+    // Only override datasize when env not provided; otherwise respect user value.
+    let datasize_env = env::var("DATASIZE").ok();
+    if datasize_env.is_none() && cfg.data_size == Config::default().data_size {
+        cfg.data_size = 100_000; // leaner default for quick runs
+    }
+    if env::var("VIRTGB").is_err() && cfg.virt_gb == Config::default().virt_gb {
+        cfg.virt_gb = 1;
+    }
+    if env::var("PHYSGB").is_err() && cfg.phys_gb == Config::default().phys_gb {
+        cfg.phys_gb = 1;
     }
     if cfg.threads == 0 {
         cfg.threads = 1;

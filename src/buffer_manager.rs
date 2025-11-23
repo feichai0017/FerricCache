@@ -122,14 +122,17 @@ impl BufferManager {
             let stats_clone = bg_stats.clone();
             // Dedicated IO context for background writes (libaio if enabled, else sync).
             let bg_io = Self::make_io_for_bg(&config, virt_size)?;
+            let bg_worker_id = if config.threads > 0 { config.threads as u16 } else { 0 };
             let handle = std::thread::spawn(move || {
+                set_worker_id(bg_worker_id);
                 Self::bg_worker(rx, bg_io, stats_clone);
             });
             (Some(handle), Some(tx))
         } else {
             (None, None)
         };
-        let worker_stats = Some(Arc::new(PerWorkerStats::new(config.threads as usize)));
+        let stat_workers = config.threads.saturating_add(1) as usize; // extra slot for bg writer stats
+        let worker_stats = Some(Arc::new(PerWorkerStats::new(stat_workers)));
         Ok(Self {
             config,
             virt_size,
@@ -303,15 +306,6 @@ impl BufferManager {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn write_page(&self, pid: u64) -> Result<()> {
-        self.io.write_page(pid, self.to_ptr(pid))?;
-        unsafe { (*self.to_ptr(pid)).dirty = false; }
-        self.write_count.fetch_add(1, Ordering::SeqCst);
-        self.stats_inc_write();
-        Ok(())
-    }
-
     /// Evict up to `batch` pages using a clock-style second chance policy.
     pub fn evict(&self) {
         // Opportunistically reap finished BGWRITE completions to avoid buildup.
@@ -385,27 +379,24 @@ impl BufferManager {
                                 }
                                 Err(TrySendError::Full(err_req)) => {
                                     self.bg_stats.saturated.fetch_add(1, Ordering::Relaxed);
-                                    // recover ownership of buffer for retry
+                                    // recover buffer ownership for retry
                                     buf = err_req.buf;
                                     attempts += 1;
                                     if attempts >= 3 {
                                         break;
                                     }
                                     std::thread::sleep(std::time::Duration::from_micros(50));
+                                    continue;
                                 }
-                                Err(TrySendError::Disconnected(_)) => {
-                                    eprintln!("bgwrite channel closed, falling back to sync");
-                                    break;
-                                }
+                                Err(TrySendError::Disconnected(_)) => break,
                             }
                         }
-                        if attempts > 0 && attempts < 3 && self.bg_inflight.lock().unwrap().contains_key(&pid) {
+                        if self.bg_inflight.lock().unwrap().contains_key(&pid) {
                             continue;
                         }
                     }
                     // fallback sync if send fails
-                    if let Err(e) = self.io.write_page(pid, self.to_ptr(pid)) {
-                        eprintln!("sync write fallback error pid {}: {}", pid, e);
+                    if let Err(_e) = self.io.write_page(pid, self.to_ptr(pid)) {
                         ps.unlock_s();
                     } else {
                         self.bg_stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
@@ -415,12 +406,10 @@ impl BufferManager {
                     }
                 }
             } else {
-                if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
-                    eprintln!("batch write error: {}", e);
+                if let Err(_e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
                     // fallback per-page
                     for &pid in &to_write {
-                        if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
-                            eprintln!("write_page fallback error pid {}: {}", pid, e2);
+                        if let Err(_e2) = self.io.write_page(pid, self.to_ptr(pid)) {
                             self.page_state_ref(pid).unlock_s();
                         } else {
                             unsafe { (*self.to_ptr(pid)).dirty = false; }
@@ -439,9 +428,9 @@ impl BufferManager {
             }
         }
 
-        // Wait for background writes if any (currently still synchronous; will be decoupled later).
+        // Wait for any inflight background writes (VMCache-style sync wait after submit).
         if self.bg_write {
-            self.wait_for_bg(to_write.as_slice());
+            self.wait_for_bg_all();
         }
 
         // Phase 2: lock clean candidates (currently MARKED)
@@ -553,6 +542,7 @@ pub struct BgStatsSnapshot {
     pub errors: u64,
     pub batches: u64,
     pub max_batch: u64,
+    pub inflight: u64,
 }
 
 impl PerWorkerStats {
@@ -711,6 +701,7 @@ impl BufferManager {
             }
             stats.batches.fetch_add(1, Ordering::Relaxed);
             stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
+
         }
     }
 
@@ -783,6 +774,7 @@ impl BufferManager {
             errors: self.bg_stats.errors.load(Ordering::Relaxed),
             batches: self.bg_stats.batches.load(Ordering::Relaxed),
             max_batch: self.bg_stats.max_batch.load(Ordering::Relaxed),
+            inflight: self.bg_inflight.lock().unwrap().len() as u64,
         })
     }
 
@@ -799,10 +791,12 @@ impl BufferManager {
 }
 
 impl BufferManager {
-    fn wait_for_bg(&self, pids: &[u64]) {
+    /// Block until all inflight bgwrites finish (used in sync VMCache-style path).
+    fn wait_for_bg_all(&self) {
         let mut inflight = self.bg_inflight.lock().unwrap();
+        let keys: Vec<u64> = inflight.keys().copied().collect();
         let mut finished = Vec::new();
-        for &pid in pids {
+        for pid in keys {
             if let Some(rx) = inflight.get(&pid) {
                 let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
                 match res {
@@ -812,8 +806,7 @@ impl BufferManager {
                         self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
                     }
-                    Err(e) => {
-                        eprintln!("bgwrite error pid {}: {}", pid, e);
+                    Err(_e) => {
                         self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
                         let _ = self.io.write_page(pid, self.to_ptr(pid));
                     }
@@ -841,15 +834,13 @@ impl BufferManager {
                         self.stats_inc_write();
                         finished.push(pid);
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("bgwrite error pid {}: {}", pid, e);
+                    Ok(Err(_e)) => {
                         self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
                         let _ = self.io.write_page(pid, self.to_ptr(pid));
                         finished.push(pid);
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
-                        eprintln!("bgwrite channel closed for pid {}", pid);
                         self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
                         finished.push(pid);
                     }

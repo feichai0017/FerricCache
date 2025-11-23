@@ -37,9 +37,7 @@ mod lbaio_impl {
     #[inline]
     fn io_destroy(ctx: AioContext) {
         let ret = unsafe { libc::syscall(libc::SYS_io_destroy, ctx) };
-        if ret < 0 {
-            eprintln!("io_destroy failed: {}", io::Error::last_os_error());
-        }
+        let _ = ret;
     }
 
     #[inline]
@@ -55,8 +53,10 @@ mod lbaio_impl {
     }
 
     #[inline]
-    fn io_getevents(ctx: AioContext, min_nr: usize, nr: usize, events: &mut [IoEvent]) -> Result<usize> {
+    fn io_getevents(ctx: AioContext, min_nr: usize, nr: usize, events: &mut [IoEvent], timeout_ns: i64) -> Result<usize> {
         debug_assert!(nr <= events.len());
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: timeout_ns };
+        let ts_ptr = if timeout_ns > 0 { &mut ts as *mut libc::timespec } else { ptr::null_mut() };
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_getevents,
@@ -64,7 +64,7 @@ mod lbaio_impl {
                 min_nr as libc::c_long,
                 nr as libc::c_long,
                 events.as_mut_ptr(),
-                ptr::null_mut::<libc::timespec>(),
+                ts_ptr,
             )
         };
         if ret < 0 {
@@ -184,12 +184,26 @@ mod lbaio_impl {
 
             let mut events: Vec<IoEvent> = vec![IoEvent { data: 0, obj: 0, res: 0, res2: 0 }; submitted];
             let mut completed = 0usize;
+            let mut idle_polls = 0;
             while completed < submitted {
-                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..])?;
+                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 1_000_000)?; // 1 ms timeout
                 if ret == 0 {
-                    break;
+                    idle_polls += 1;
+                    if idle_polls > 5 {
+                        break;
+                    }
+                    continue;
                 }
+                idle_polls = 0;
                 completed += ret;
+            }
+            if completed < submitted {
+                // Fallback to sync writes for remaining to ensure durability.
+                for &pid in pids {
+                    let ptr = unsafe { base.add(pid as usize) };
+                    self.write_page(pid, ptr)?;
+                }
+                return Err("io_getevents timeout".into());
             }
             let mut failures = Vec::new();
             for ev in events.iter().take(completed) {
