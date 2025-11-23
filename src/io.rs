@@ -32,6 +32,15 @@ pub trait PageIo: Send + Sync {
         let ptr = buf.as_ptr() as *const Page;
         self.write_page(pid, ptr)
     }
+
+    /// Optional async batch write with owned buffers; returns a receiver signaled on completion.
+    /// Default: None (not supported).
+    fn write_pages_async(
+        &self,
+        _bufs: Vec<(u64, Vec<u8>)>,
+    ) -> Option<std::sync::mpsc::Receiver<Result<()>>> {
+        None
+    }
 }
 
 /// Synchronous file-based IO implementation using pread/pwrite.

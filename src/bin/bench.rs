@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use std::thread;
+use std::sync::atomic::AtomicU64;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 fn main() -> ferric_cache::Result<()> {
     let mut cfg = Config::from_env();
@@ -49,9 +52,12 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
 
     // Optional periodic stats printer (env STATS_INTERVAL_SECS).
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some(intv) = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
+    let stats_intv = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+    if stats_intv > 0 {
         let bm_stats = bm.clone();
         let stop_flag = stop.clone();
+        let csv = StatsCsv::new();
+        let start = Instant::now();
         thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 // reap bgwrite completions even when eviction not running
@@ -77,7 +83,8 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
                     bg.enqueued,
                     bg.errors,
                 );
-                thread::sleep(Duration::from_secs(intv));
+                csv.log(start.elapsed(), total_reads, total_faults, total_evicts, total_writes, &bg, &snap.exmap);
+                thread::sleep(Duration::from_secs(stats_intv));
             }
         });
     }
@@ -200,9 +207,14 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
 
     // Optional periodic stats printer (env STATS_INTERVAL_SECS).
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some(intv) = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
+    let stats_intv = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+    let shared_counters = Arc::new(TpccCountersAtomic::default());
+    if stats_intv > 0 {
         let bm_stats = bm.clone();
         let stop_flag = stop.clone();
+        let counters = shared_counters.clone();
+        let csv = StatsCsv::new();
+        let start = Instant::now();
         thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 bm_stats.poll_bg_completions();
@@ -213,8 +225,9 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                 let total_evicts = snap.worker.as_ref().map(|w| w.iter().map(|s| s.evicts).sum::<u64>()).unwrap_or(0);
                 let hit_rate = if total_reads == 0 { 0.0 } else { 1.0 - (total_faults as f64 / total_reads as f64) };
                 let bg = snap.bgwrite.unwrap_or_default();
+                let live = counters.snapshot();
                 println!(
-                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}",
+                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}, new_order={}, payment={}, order_status={}, stock_level={}, delivery={}",
                     total_reads,
                     total_faults,
                     hit_rate,
@@ -226,8 +239,14 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                     bg.completed,
                     bg.enqueued,
                     bg.errors,
+                    live.new_order,
+                    live.payment,
+                    live.order_status,
+                    live.stock_level,
+                    live.delivery,
                 );
-                thread::sleep(Duration::from_secs(intv));
+                csv.log(start.elapsed(), total_reads, total_faults, total_evicts, total_writes, &bg, &snap.exmap);
+                thread::sleep(Duration::from_secs(stats_intv));
             }
         });
     }
@@ -239,6 +258,7 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
         let tree_cloned = tree.clone();
         let barrier = barrier.clone();
         let cfg_cloned = cfg.clone();
+        let counters_shared = shared_counters.clone();
         handles.push(thread::spawn(move || -> ferric_cache::Result<(TpccCounters, u64)> {
             set_worker_id(tid as u16);
             barrier.wait();
@@ -263,6 +283,7 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                         let _ = tree_cloned.insert(&key, &payload);
                         next_order_id = next_order_id.wrapping_add(1);
                         counters.new_order += 1;
+                        counters_shared.new_order.fetch_add(1, Ordering::Relaxed);
                     }
                     1 => {
                         // payment: update customer balance (decrement)
@@ -284,6 +305,7 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                             let _ = tree_cloned.insert(&key, &1_000u64.to_le_bytes());
                         }
                         counters.payment += 1;
+                        counters_shared.payment.fetch_add(1, Ordering::Relaxed);
                     }
                     2 => {
                         // order status: lookup customer
@@ -293,6 +315,7 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                         let key = customer_key(wh, dist, cust);
                         let _ = tree_cloned.lookup(&key, |_| {});
                         counters.order_status += 1;
+                        counters_shared.order_status.fetch_add(1, Ordering::Relaxed);
                     }
                     3 => {
                         // stock level: scan a small range of orders
@@ -305,6 +328,7 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                             seen < 20 // stop after small batch
                         });
                         counters.stock_level += 1;
+                        counters_shared.stock_level.fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {
                         // delivery: delete last order if exists
@@ -315,9 +339,11 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
                             let _ = tree_cloned.delete(&key);
                         }
                         counters.delivery += 1;
+                        counters_shared.delivery.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 counters.ops += 1;
+                counters_shared.ops.fetch_add(1, Ordering::Relaxed);
             }
             let elapsed = Instant::now() - start;
             Ok((counters, elapsed.as_micros() as u64))
@@ -412,6 +438,79 @@ impl TpccCounters {
     }
 }
 
+#[derive(Default)]
+struct TpccCountersAtomic {
+    ops: AtomicU64,
+    new_order: AtomicU64,
+    payment: AtomicU64,
+    order_status: AtomicU64,
+    stock_level: AtomicU64,
+    delivery: AtomicU64,
+}
+
+impl TpccCountersAtomic {
+    fn snapshot(&self) -> TpccCounters {
+        TpccCounters {
+            ops: self.ops.load(Ordering::Relaxed),
+            new_order: self.new_order.load(Ordering::Relaxed),
+            payment: self.payment.load(Ordering::Relaxed),
+            order_status: self.order_status.load(Ordering::Relaxed),
+            stock_level: self.stock_level.load(Ordering::Relaxed),
+            delivery: self.delivery.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct StatsCsv {
+    file: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+impl StatsCsv {
+    fn new() -> Self {
+        let path = env::var("STATS_CSV").ok();
+        if let Some(p) = path {
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
+                // write header if file is empty
+                if f.metadata().map(|m| m.len()).unwrap_or(1) == 0 {
+                    let _ = writeln!(f, "secs,reads,faults,evicts,writes,bg_queue,bg_inflight,bg_done,bg_enq,bg_err,exmap_active");
+                }
+                return Self { file: Some(std::sync::Mutex::new(f)) };
+            }
+        }
+        Self { file: None }
+    }
+
+    fn log(
+        &self,
+        elapsed: Duration,
+        reads: u64,
+        faults: u64,
+        evicts: u64,
+        writes: u64,
+        bg: &ferric_cache::buffer_manager::BgStatsSnapshot,
+        exmap: &ferric_cache::buffer_manager::ExmapSnapshot,
+    ) {
+        if let Some(lock) = &self.file {
+            if let Ok(mut f) = lock.lock() {
+                let _ = writeln!(
+                    f,
+                    "{:.3},{},{},{},{},{},{},{},{},{},{}",
+                    elapsed.as_secs_f64(),
+                    reads,
+                    faults,
+                    evicts,
+                    writes,
+                    bg.queue_len,
+                    bg.inflight,
+                    bg.completed,
+                    bg.enqueued,
+                    bg.errors,
+                    exmap.active
+                );
+            }
+        }
+    }
+}
 #[inline]
 fn customer_key(wh: u64, dist: u64, cust: u64) -> [u8; 8] {
     // layout: [table=1|wh|dist|cust]

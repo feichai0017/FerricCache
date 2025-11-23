@@ -57,6 +57,10 @@ pub struct BufferManager {
     pub batch: u64,
     /// Page IO backend.
     pub io: Arc<dyn PageIo>,
+    /// Inflight async IO count for libaio submissions.
+    pub io_inflight_count: Arc<AtomicU64>,
+    /// Condvar to park/unpark when inflight is saturated.
+    pub io_inflight_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
     /// Simple free list for reclaimed page IDs.
     pub free_list: Mutex<Vec<u64>>,
     /// Background write toggle.
@@ -106,7 +110,11 @@ impl BufferManager {
                 .create(true)
                 .open(&config.block_path)?;
             file.set_len(virt_size)?;
-            LibaioIo::open(file, 256)?
+            let affinity = config
+                .io_affinity
+                .as_ref()
+                .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect::<Vec<_>>());
+            LibaioIo::open(file, config.io_depth as usize, config.io_workers as usize, affinity)?
         };
         #[cfg(not(feature = "libaio"))]
         let io: Arc<dyn PageIo> = SyncFileIo::open_with_len(&config.block_path, virt_size)?;
@@ -129,15 +137,19 @@ impl BufferManager {
 
         let bg_write = config.bg_write;
         let bg_stats = Arc::new(BgStats::default());
+        let io_inflight_count = Arc::new(AtomicU64::new(0));
+        let io_inflight_cv = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
         let (bg_handle, bg_tx) = if bg_write {
             let (tx, rx) = crossbeam_channel::bounded::<BgRequest>(batch as usize * 2 + 1);
             let stats_clone = bg_stats.clone();
+            let inflight_clone = io_inflight_count.clone();
+            let inflight_cv_clone = io_inflight_cv.clone();
             // Dedicated IO context for background writes (libaio if enabled, else sync).
             let bg_io = Self::make_io_for_bg(&config, virt_size)?;
             let bg_worker_id = if config.threads > 0 { config.threads as u16 } else { 0 };
             let handle = std::thread::spawn(move || {
                 set_worker_id(bg_worker_id);
-                Self::bg_worker(rx, bg_io, stats_clone);
+                Self::bg_worker(rx, bg_io, stats_clone, inflight_clone, inflight_cv_clone, config.io_depth);
             });
             (Some(handle), Some(tx))
         } else {
@@ -162,6 +174,8 @@ impl BufferManager {
             resident_set: ResidentPageSet::new(phys_count),
             batch,
             io,
+            io_inflight_count,
+            io_inflight_cv,
             free_list: Mutex::new(Vec::new()),
             bg_write,
             bg_handle,
@@ -579,6 +593,7 @@ pub struct BgStatsSnapshot {
     pub max_batch: u64,
     pub inflight: u64,
     pub queue_len: u64,
+    pub retries: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -658,11 +673,19 @@ pub struct BgStats {
     pub errors: AtomicU64,
     pub batches: AtomicU64,
     pub max_batch: AtomicU64,
+    pub retries: AtomicU64,
 }
 
 impl BufferManager {
     /// Background writer thread: receives page copies and writes them out.
-    fn bg_worker(rx: CbReceiver<BgRequest>, io: Arc<dyn PageIo>, stats: Arc<BgStats>) {
+    fn bg_worker(
+        rx: CbReceiver<BgRequest>,
+        io: Arc<dyn PageIo>,
+        stats: Arc<BgStats>,
+        inflight_count: Arc<AtomicU64>,
+        inflight_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
+        inflight_limit: u64,
+    ) {
         let mut batch = Vec::with_capacity(64);
         loop {
             batch.clear();
@@ -703,7 +726,49 @@ impl BufferManager {
                 }
             }
             if contiguous {
-                // allocate temporary contiguous buffer to pass to write_pages
+                // Attempt async batch if supported and inflight under limit.
+                let mut bufs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch_len);
+                for (idx, req) in batch.iter().enumerate() {
+                    bufs.push((first_pid + idx as u64, req.buf.clone()));
+                }
+                if let Some(rx) = io.write_pages_async(bufs) {
+                    let needed = batch_len as u64;
+                    // park/backoff until inflight allows submission; if unable after several attempts, fallback.
+                    if Self::wait_for_inflight(&inflight_count, &inflight_cv, inflight_limit, needed) {
+                        inflight_count.fetch_add(needed, Ordering::SeqCst);
+                        let res = rx.recv().unwrap_or_else(|_| Err("async channel closed".into()));
+                        let mut had_err = res.is_err();
+                        if let Err(_e) = &res {
+                            // retry once synchronously for hard errors
+                            for req in &batch {
+                                let _ = io.write_page(req.pid, req.buf.as_ptr() as *const Page);
+                            }
+                            stats.retries.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for req in batch.drain(..) {
+                            let mapped = res.as_ref().map(|_| ()).map_err(|e| e.to_string().into());
+                            if mapped.is_err() {
+                                had_err = true;
+                            }
+                            let _ = req.done.send(mapped);
+                        }
+                        if had_err {
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.completed.fetch_add(batch_len as u64, Ordering::Relaxed);
+                        }
+                        stats.batches.fetch_add(1, Ordering::Relaxed);
+                        stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
+                        inflight_count.fetch_sub(needed, Ordering::SeqCst);
+                        // notify any waiters that inflight dropped
+                        inflight_cv.1.notify_all();
+                        continue;
+                    } else {
+                        stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                // fallback sync batch
                 let mut tmp = Vec::with_capacity(batch_len * PAGE_SIZE);
                 for req in &batch {
                     tmp.extend_from_slice(&req.buf);
@@ -711,15 +776,22 @@ impl BufferManager {
                 let base_ptr = tmp.as_ptr() as *const Page;
                 let pid_list: Vec<u64> = (0..batch_len).map(|i| first_pid + i as u64).collect();
                 let res = io.write_pages(&pid_list, base_ptr);
-                for req in batch.drain(..) {
-                    let _ = req.done.send(res.as_ref().map(|_| ()).map_err(|e| {
-                        let msg = format!("{}", e);
-                        msg.into()
-                    }));
-                    if res.is_ok() {
+                if res.is_err() {
+                    // partial retry per-page on failure
+                    stats.retries.fetch_add(1, Ordering::Relaxed);
+                    for req in batch.drain(..) {
+                        let per = io.write_page(req.pid, req.buf.as_ptr() as *const Page);
+                        let _ = req.done.send(per.as_ref().map(|_| ()).map_err(|e| e.to_string().into()));
+                        if per.is_ok() {
+                            stats.completed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    for req in batch.drain(..) {
+                        let _ = req.done.send(Ok(()));
                         stats.completed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        stats.errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             } else {
@@ -757,7 +829,11 @@ impl BufferManager {
                 .create(true)
                 .open(&config.block_path)?;
             file.set_len(virt_size)?;
-            return LibaioIo::open(file, 256);
+            let affinity = config
+                .io_affinity
+                .as_ref()
+                .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect::<Vec<_>>());
+            return LibaioIo::open(file, config.io_depth as usize, config.io_workers as usize, affinity);
         }
         #[cfg(not(feature = "libaio"))]
         {
@@ -820,6 +896,7 @@ impl BufferManager {
             max_batch: self.bg_stats.max_batch.load(Ordering::Relaxed),
             inflight: self.bg_inflight.lock().unwrap().len() as u64,
             queue_len: queued,
+            retries: self.bg_stats.retries.load(Ordering::Relaxed),
         })
     }
 
@@ -901,5 +978,27 @@ impl BufferManager {
         if PageState::state(v) == state::UNLOCKED {
             let _ = ps.try_mark(v);
         }
+    }
+
+    /// Park/backoff until inflight allows additional async submissions; returns false if limit persists.
+    fn wait_for_inflight(
+        count: &Arc<AtomicU64>,
+        cv: &Arc<(Mutex<()>, std::sync::Condvar)>,
+        limit: u64,
+        need: u64,
+    ) -> bool {
+        let mut attempts = 0;
+        while attempts < 5 {
+            let current = count.load(Ordering::SeqCst);
+            if current + need <= limit {
+                return true;
+            }
+            attempts += 1;
+            // Park on condvar to be woken when inflight drains or on timeout.
+            let (lock, cvar) = (&cv.0, &cv.1);
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, std::time::Duration::from_micros(50 * (1 << attempts)));
+        }
+        false
     }
 }

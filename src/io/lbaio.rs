@@ -2,6 +2,7 @@
 mod lbaio_impl {
     use crate::memory::{page::Page, PAGE_SIZE};
     use crate::Result;
+    use crate::thread_local::get_worker_id;
     use libc::c_void;
     use std::io;
     use std::fs::File;
@@ -9,6 +10,7 @@ mod lbaio_impl {
     use std::slice;
     use std::sync::Arc;
     use std::ptr;
+    use crossbeam_channel::{Sender, Receiver};
 
     /// Minimal `io_event` mirror (not provided by libc).
     #[repr(C)]
@@ -77,6 +79,8 @@ mod lbaio_impl {
         file: File,
         ctx: AioContext,
         _max_ios: usize,
+        async_tx: Vec<Sender<AsyncReq>>,
+        affinity: Option<Vec<usize>>,
     }
 
     unsafe impl Send for LibaioIo {}
@@ -89,11 +93,145 @@ mod lbaio_impl {
     }
 
     impl LibaioIo {
-        pub fn open(file: File, max_ios: usize) -> Result<Arc<Self>> {
+        pub fn open(file: File, max_ios: usize, workers: usize, affinity: Option<Vec<usize>>) -> Result<Arc<Self>> {
             let mut ctx: AioContext = 0;
             io_setup(max_ios, &mut ctx)?;
-            Ok(Arc::new(Self { file, ctx, _max_ios: max_ios }))
+            let mut senders = Vec::with_capacity(workers.max(1));
+            let io = Arc::new(Self { file, ctx, _max_ios: max_ios, async_tx: Vec::new(), affinity: affinity.clone() });
+            for i in 0..workers.max(1) {
+                let (tx, rx) = crossbeam_channel::bounded::<AsyncReq>(max_ios.max(1));
+                senders.push(tx);
+                let io_clone = io.clone();
+                let aff_idx = affinity.as_ref().and_then(|v| v.get(i)).copied();
+                std::thread::spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(cpu) = aff_idx {
+                        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                        unsafe {
+                            libc::CPU_ZERO(&mut set);
+                            libc::CPU_SET(cpu, &mut set);
+                            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                        }
+                    }
+                    io_clone.async_worker(rx);
+                });
+            }
+            // Safety: we constructed io with empty async_tx above; replace with senders now.
+            let io_ptr = Arc::as_ptr(&io) as *mut LibaioIo;
+            unsafe {
+                (*io_ptr).async_tx = senders;
+            }
+            Ok(io)
         }
+
+        fn async_worker(&self, rx: Receiver<AsyncReq>) {
+            for req in rx {
+                let _ = self.handle_async_req(req);
+            }
+        }
+
+        fn handle_async_req(&self, req: AsyncReq) -> Result<()> {
+            let mut cbs: Vec<libc::iocb> = Vec::with_capacity(req.bufs.len());
+            let mut cb_ptrs: Vec<*mut libc::iocb> = Vec::with_capacity(req.bufs.len());
+            for (idx, (pid, buf)) in req.bufs.iter().enumerate() {
+                let mut cb: libc::iocb = unsafe { std::mem::zeroed() };
+                cb.aio_fildes = self.file.as_raw_fd() as u32;
+                cb.aio_lio_opcode = IOCB_CMD_PWRITE as u16;
+                cb.aio_data = *pid;
+                cb.aio_buf = buf.as_ptr() as u64;
+                cb.aio_nbytes = buf.len() as u64;
+                cb.aio_offset = (pid * PAGE_SIZE as u64) as i64;
+                cbs.push(cb);
+                cb_ptrs.push(cbs.as_mut_ptr().wrapping_add(idx));
+            }
+            if cb_ptrs.is_empty() {
+                let _ = req.done.send(Ok(()));
+                return Ok(());
+            }
+            let mut submitted = 0usize;
+            let mut retries = 0;
+            while submitted < cb_ptrs.len() {
+                match io_submit(self.ctx, &mut cb_ptrs[submitted..]) {
+                    Ok(0) => {
+                        retries += 1;
+                        if retries > 3 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(50 * retries as u64));
+                        continue;
+                    }
+                    Ok(n) => {
+                        submitted += n;
+                        retries = 0;
+                    }
+                    Err(e) => {
+                        // fallback sync for remaining
+                        for (pid, buf) in &req.bufs[submitted..] {
+                            let ptr = buf.as_ptr() as *const Page;
+                            let _ = self.write_page(*pid, ptr);
+                        }
+                        let _ = req.done.send(Err(e));
+                        return Err("io_submit failed".into());
+                    }
+                }
+            }
+            if submitted == 0 {
+                // fallback to sync write
+                for (pid, buf) in req.bufs {
+                    let ptr = buf.as_ptr() as *const Page;
+                    let _ = self.write_page(pid, ptr);
+                }
+                let _ = req.done.send(Err("io_submit returned 0".into()));
+                return Err("io_submit returned 0".into());
+            }
+            let mut events: Vec<IoEvent> = vec![IoEvent { data: 0, obj: 0, res: 0, res2: 0 }; submitted];
+            let mut completed = 0usize;
+            let mut idle_polls = 0;
+            while completed < submitted {
+                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 500_000)?;
+                if ret == 0 {
+                    idle_polls += 1;
+                    if idle_polls > 10 {
+                        break;
+                    }
+                    continue;
+                }
+                idle_polls = 0;
+                completed += ret;
+            }
+            if completed < submitted {
+                for (pid, buf) in req.bufs {
+                    let ptr = buf.as_ptr() as *const Page;
+                    let _ = self.write_page(pid, ptr);
+                }
+                let _ = req.done.send(Err("io_getevents timeout".into()));
+                return Err("io_getevents timeout".into());
+            }
+            let mut ok = true;
+            for ev in events.iter().take(completed) {
+                if ev.res < 0 || ev.res as usize != req.bufs[0].1.len() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let _ = req.done.send(Ok(()));
+                Ok(())
+            } else {
+                // retry per-page synchronously on failure
+                for (pid, buf) in req.bufs {
+                    let ptr = buf.as_ptr() as *const Page;
+                    let _ = self.write_page(pid, ptr);
+                }
+                let _ = req.done.send(Err("async write error".into()));
+                Err("async write error".into())
+            }
+        }
+    }
+
+    struct AsyncReq {
+        bufs: Vec<(u64, Vec<u8>)>,
+        done: std::sync::mpsc::Sender<Result<()>>,
     }
 
     impl crate::io::PageIo for LibaioIo {
@@ -185,11 +323,12 @@ mod lbaio_impl {
             let mut events: Vec<IoEvent> = vec![IoEvent { data: 0, obj: 0, res: 0, res2: 0 }; submitted];
             let mut completed = 0usize;
             let mut idle_polls = 0;
+            // Poll with short timeout; if repeatedly idle, fall back to synchronous completion.
             while completed < submitted {
-                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 1_000_000)?; // 1 ms timeout
+                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 500_000)?; // 0.5 ms timeout
                 if ret == 0 {
                     idle_polls += 1;
-                    if idle_polls > 5 {
+                    if idle_polls > 10 {
                         break;
                     }
                     continue;
@@ -225,6 +364,22 @@ mod lbaio_impl {
                 }
             }
             Ok(())
+        }
+
+        fn write_pages_async(
+            &self,
+            bufs: Vec<(u64, Vec<u8>)>,
+        ) -> Option<std::sync::mpsc::Receiver<Result<()>>> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let req = AsyncReq { bufs, done: tx };
+            if self.async_tx.is_empty() {
+                return None;
+            }
+            let idx = (get_worker_id() as usize) % self.async_tx.len();
+            match self.async_tx[idx].try_send(req) {
+                Ok(_) => Some(rx),
+                Err(_) => None,
+            }
         }
     }
 }
