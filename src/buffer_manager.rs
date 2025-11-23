@@ -17,7 +17,7 @@ use crate::thread_local::{get_worker_id, set_worker_id};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc::{Sender, Receiver, TryRecvError};
 use std::cell::Cell;
 
 /// Core buffer manager responsible for page lifecycle.
@@ -61,6 +61,8 @@ pub struct BufferManager {
     pub bg_tx: Option<CbSender<BgRequest>>,
     /// BGWRITE stats.
     pub bg_stats: Arc<BgStats>,
+    /// Tracking inflight async writes (pid -> completion rx).
+    pub bg_inflight: Mutex<std::collections::HashMap<u64, Receiver<FerricResult<()>>>>,
     /// Optional per-worker stats.
     pub worker_stats: Option<Arc<PerWorkerStats>>,
     /// Allocator for worker ids.
@@ -117,10 +119,11 @@ impl BufferManager {
         let bg_stats = Arc::new(BgStats::default());
         let (bg_handle, bg_tx) = if bg_write {
             let (tx, rx) = crossbeam_channel::bounded::<BgRequest>(batch as usize * 2 + 1);
-            let io_clone = io.clone();
             let stats_clone = bg_stats.clone();
+            // Dedicated IO context for background writes (libaio if enabled, else sync).
+            let bg_io = Self::make_io_for_bg(&config, virt_size)?;
             let handle = std::thread::spawn(move || {
-                Self::bg_worker(rx, io_clone, stats_clone);
+                Self::bg_worker(rx, bg_io, stats_clone);
             });
             (Some(handle), Some(tx))
         } else {
@@ -147,6 +150,7 @@ impl BufferManager {
             bg_handle,
             bg_tx,
             bg_stats,
+            bg_inflight: Mutex::new(std::collections::HashMap::new()),
             worker_stats,
             worker_id_alloc: AtomicU64::new(0),
         })
@@ -310,10 +314,14 @@ impl BufferManager {
 
     /// Evict up to `batch` pages using a clock-style second chance policy.
     pub fn evict(&self) {
+        // Opportunistically reap finished BGWRITE completions to avoid buildup.
+        if self.bg_write {
+            self.poll_bg_completions();
+        }
         let batch = self.batch as usize;
         let mut to_evict: Vec<u64> = Vec::with_capacity(batch);
         let mut to_write: Vec<u64> = Vec::with_capacity(batch);
-        let mut bg_wait: Vec<(u64, Receiver<FerricResult<()>>)> = Vec::with_capacity(batch);
+        let _bg_wait: Vec<(u64, Receiver<FerricResult<()>>)> = Vec::with_capacity(batch);
         let mut scanned: u64 = 0;
         let max_scan = self.resident_set.capacity();
 
@@ -356,28 +364,33 @@ impl BufferManager {
             }
         }
 
-        // Phase 1: write dirty pages (still S-locked)
+        // Phase 1: write dirty pages (still S-locked). If bg_write is enabled, enqueue and track inflight.
         if !to_write.is_empty() {
             if self.bg_write {
                 for &pid in &to_write {
                     let ps = self.page_state_ref(pid);
-                    let buf = unsafe {
+                    let mut buf = unsafe {
                         std::slice::from_raw_parts(self.to_ptr(pid) as *const u8, PAGE_SIZE).to_vec()
                     };
                     if let Some(tx) = &self.bg_tx {
                         let (done_tx, done_rx) = std::sync::mpsc::channel();
                         // try to enqueue; if full or closed, fall back to sync write
-                        let mut sent = false;
-                        for _ in 0..3 {
-                            match tx.try_send(BgRequest { pid, buf: buf.clone(), done: done_tx.clone() }) {
+                        let mut attempts = 0;
+                        loop {
+                            match tx.try_send(BgRequest { pid, buf, done: done_tx.clone() }) {
                                 Ok(_) => {
                                     self.bg_stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                                    bg_wait.push((pid, done_rx));
-                                    sent = true;
+                                    self.bg_inflight.lock().unwrap().insert(pid, done_rx);
                                     break;
                                 }
-                                Err(TrySendError::Full(_)) => {
+                                Err(TrySendError::Full(err_req)) => {
                                     self.bg_stats.saturated.fetch_add(1, Ordering::Relaxed);
+                                    // recover ownership of buffer for retry
+                                    buf = err_req.buf;
+                                    attempts += 1;
+                                    if attempts >= 3 {
+                                        break;
+                                    }
                                     std::thread::sleep(std::time::Duration::from_micros(50));
                                 }
                                 Err(TrySendError::Disconnected(_)) => {
@@ -386,7 +399,7 @@ impl BufferManager {
                                 }
                             }
                         }
-                        if sent {
+                        if attempts > 0 && attempts < 3 && self.bg_inflight.lock().unwrap().contains_key(&pid) {
                             continue;
                         }
                     }
@@ -426,25 +439,9 @@ impl BufferManager {
             }
         }
 
-        // Wait for background writes (if any)
+        // Wait for background writes if any (currently still synchronous; will be decoupled later).
         if self.bg_write {
-            for (pid, rx) in bg_wait {
-                let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
-                match res {
-                    Ok(()) => {
-                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
-                        unsafe { (*self.to_ptr(pid)).dirty = false; }
-                        self.write_count.fetch_add(1, Ordering::SeqCst);
-                        self.stats_inc_write();
-                    }
-                    Err(e) => {
-                        eprintln!("bgwrite error pid {}: {}", pid, e);
-                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
-                        // try sync fallback
-                        let _ = self.io.write_page(pid, self.to_ptr(pid));
-                    }
-                }
-            }
+            self.wait_for_bg(to_write.as_slice());
         }
 
         // Phase 2: lock clean candidates (currently MARKED)
@@ -716,6 +713,23 @@ impl BufferManager {
             stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
         }
     }
+
+    fn make_io_for_bg(config: &Config, virt_size: u64) -> Result<Arc<dyn PageIo>> {
+        #[cfg(feature = "libaio")]
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&config.block_path)?;
+            file.set_len(virt_size)?;
+            return LibaioIo::open(file, 256);
+        }
+        #[cfg(not(feature = "libaio"))]
+        {
+            Ok(SyncFileIo::open_with_len(&config.block_path, virt_size)? as Arc<dyn PageIo>)
+        }
+    }
     fn stat_index(&self) -> Option<usize> {
         let id = get_worker_id() as usize;
         self.worker_stats.as_ref().and_then(|stats| {
@@ -780,6 +794,70 @@ impl BufferManager {
             alloc: self.alloc_count.load(Ordering::Relaxed),
             worker: self.worker_stats(),
             bgwrite: self.bg_stats_snapshot(),
+        }
+    }
+}
+
+impl BufferManager {
+    fn wait_for_bg(&self, pids: &[u64]) {
+        let mut inflight = self.bg_inflight.lock().unwrap();
+        let mut finished = Vec::new();
+        for &pid in pids {
+            if let Some(rx) = inflight.get(&pid) {
+                let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
+                match res {
+                    Ok(()) => {
+                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        self.write_count.fetch_add(1, Ordering::SeqCst);
+                        self.stats_inc_write();
+                    }
+                    Err(e) => {
+                        eprintln!("bgwrite error pid {}: {}", pid, e);
+                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = self.io.write_page(pid, self.to_ptr(pid));
+                    }
+                }
+                finished.push(pid);
+            }
+        }
+        for pid in finished {
+            inflight.remove(&pid);
+        }
+    }
+
+    /// Non-blocking reap of background completions to reduce queue pressure.
+    fn poll_bg_completions(&self) {
+        let mut inflight = self.bg_inflight.lock().unwrap();
+        let keys: Vec<u64> = inflight.keys().copied().collect();
+        let mut finished = Vec::new();
+        for pid in keys {
+            if let Some(rx) = inflight.get(&pid) {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        self.write_count.fetch_add(1, Ordering::SeqCst);
+                        self.stats_inc_write();
+                        finished.push(pid);
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("bgwrite error pid {}: {}", pid, e);
+                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = self.io.write_page(pid, self.to_ptr(pid));
+                        finished.push(pid);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        eprintln!("bgwrite channel closed for pid {}", pid);
+                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
+                        finished.push(pid);
+                    }
+                }
+            }
+        }
+        for pid in finished {
+            inflight.remove(&pid);
         }
     }
 }

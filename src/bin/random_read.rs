@@ -91,8 +91,8 @@ fn main() -> ferric_cache::Result<()> {
     }
     if let Some(bg) = stats.bgwrite {
         println!(
-            "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}",
-            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors
+            "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}, batches={}, max_batch={}",
+            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors, bg.batches, bg.max_batch
         );
     }
     Ok(())
