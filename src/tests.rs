@@ -16,6 +16,7 @@ mod mixed_stress;
 mod worker_id;
 mod stats_tests;
 mod insert_regression;
+mod exmap_status;
 
 #[test]
 fn page_state_shared_and_mark_unlocks() {

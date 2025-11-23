@@ -5,6 +5,7 @@ use crate::memory::{
     ResidentPageSet,
     VirtualRegion,
     create_region,
+    RegionKind,
     PAGE_SIZE,
 };
 use crate::Result;
@@ -44,6 +45,10 @@ pub struct BufferManager {
     pub write_count: AtomicU64,
     /// Virtual memory region (mmap or exmap).
     pub virt_region: VirtualRegion,
+    /// Region kind used (mmap or exmap).
+    pub region_kind: RegionKind,
+    /// Optional reason when exmap requested but not active.
+    pub exmap_reason: Option<String>,
     /// Per-page state array.
     pub page_state: Vec<PageState>,
     /// Tracks currently resident pages for eviction.
@@ -107,9 +112,13 @@ impl BufferManager {
         let io: Arc<dyn PageIo> = SyncFileIo::open_with_len(&config.block_path, virt_size)?;
 
         let page_count = usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?;
-        let (virt_region, used_exmap) = create_region(page_count, config.use_exmap)?;
-        if config.use_exmap && !used_exmap {
-            eprintln!("exmap requested but unavailable; falling back to mmap");
+        let (virt_region, region_kind, exmap_reason) = create_region(page_count, config.use_exmap)?;
+        if config.use_exmap && region_kind != RegionKind::Exmap {
+            if let Some(msg) = &exmap_reason {
+                eprintln!("exmap requested but unavailable; falling back to mmap ({msg})");
+            } else {
+                eprintln!("exmap requested but unavailable; falling back to mmap");
+            }
         }
         let mut page_state = Vec::with_capacity(virt_count as usize);
         for _ in 0..virt_count {
@@ -147,6 +156,8 @@ impl BufferManager {
             read_count: AtomicU64::new(0),
             write_count: AtomicU64::new(0),
             virt_region,
+            region_kind,
+            exmap_reason,
             page_state,
             resident_set: ResidentPageSet::new(phys_count),
             batch,
@@ -547,6 +558,7 @@ pub struct StatsSnapshot {
     pub alloc: u64,
     pub worker: Option<Vec<WorkerStats>>,
     pub bgwrite: Option<BgStatsSnapshot>,
+    pub exmap: ExmapSnapshot,
 }
 
 pub struct PerWorkerStats {
@@ -566,6 +578,14 @@ pub struct BgStatsSnapshot {
     pub batches: u64,
     pub max_batch: u64,
     pub inflight: u64,
+    pub queue_len: u64,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct ExmapSnapshot {
+    pub requested: bool,
+    pub active: bool,
+    pub reason: Option<String>,
 }
 
 impl PerWorkerStats {
@@ -789,6 +809,7 @@ impl BufferManager {
         if !self.bg_write {
             return None;
         }
+        let queued = self.bg_tx.as_ref().map(|tx| tx.len() as u64).unwrap_or(0);
         Some(BgStatsSnapshot {
             enqueued: self.bg_stats.enqueued.load(Ordering::Relaxed),
             completed: self.bg_stats.completed.load(Ordering::Relaxed),
@@ -798,6 +819,7 @@ impl BufferManager {
             batches: self.bg_stats.batches.load(Ordering::Relaxed),
             max_batch: self.bg_stats.max_batch.load(Ordering::Relaxed),
             inflight: self.bg_inflight.lock().unwrap().len() as u64,
+            queue_len: queued,
         })
     }
 
@@ -809,30 +831,18 @@ impl BufferManager {
             alloc: self.alloc_count.load(Ordering::Relaxed),
             worker: self.worker_stats(),
             bgwrite: self.bg_stats_snapshot(),
+            exmap: ExmapSnapshot {
+                requested: self.config.use_exmap,
+                active: matches!(self.region_kind, RegionKind::Exmap),
+                reason: self.exmap_reason.clone(),
+            },
         }
     }
 }
 
 impl BufferManager {
-    /// Block until all inflight bgwrites finish (used in sync VMCache-style path).
-    fn wait_for_bg_all(&self) {
-        let mut inflight = self.bg_inflight.lock().unwrap();
-        let keys: Vec<u64> = inflight.keys().copied().collect();
-        let mut finished = Vec::new();
-        for pid in keys {
-            if let Some(rx) = inflight.get(&pid) {
-                let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
-                self.handle_bg_completion(pid, res);
-                finished.push(pid);
-            }
-        }
-        for pid in finished {
-            inflight.remove(&pid);
-        }
-    }
-
     /// Non-blocking reap of background completions to reduce queue pressure.
-    fn poll_bg_completions(&self) {
+    pub fn poll_bg_completions(&self) {
         let mut inflight = self.bg_inflight.lock().unwrap();
         let keys: Vec<u64> = inflight.keys().copied().collect();
         let mut finished = Vec::new();

@@ -26,11 +26,7 @@ impl ExmapRegion {
             .checked_mul(PAGE_SIZE)
             .ok_or("page_count too large")?;
         // Open the exmap device; caller should ensure the module is loaded.
-        let dev = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/exmap")
-            .map_err(|e| format!("open /dev/exmap failed: {}", e))?;
+        let dev = Self::open_device()?;
         let raw = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -51,6 +47,21 @@ impl ExmapRegion {
             len_bytes,
             _dev: dev,
         })
+    }
+
+    /// Lightweight probe to see if /dev/exmap is usable.
+    pub fn probe() -> Result<()> {
+        let _ = Self::open_device()?;
+        Ok(())
+    }
+
+    fn open_device() -> Result<std::fs::File> {
+        let dev = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/exmap")
+            .map_err(|e| format!("open /dev/exmap failed: {}", e))?;
+        Ok(dev)
     }
 
     #[inline]
@@ -78,6 +89,10 @@ pub struct ExmapRegion;
 #[cfg(not(target_os = "linux"))]
 impl ExmapRegion {
     pub fn new(_page_count: usize) -> Result<Self> {
+        Err("exmap is only supported on Linux".into())
+    }
+
+    pub fn probe() -> Result<()> {
         Err("exmap is only supported on Linux".into())
     }
 }

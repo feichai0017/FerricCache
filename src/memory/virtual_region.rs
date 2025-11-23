@@ -8,6 +8,13 @@ pub enum VirtualRegion {
     Exmap(ExmapRegion),
 }
 
+/// Actual region kind used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionKind {
+    Mmap,
+    Exmap,
+}
+
 impl VirtualRegion {
     pub fn mmap(page_count: usize) -> Result<Self> {
         Ok(Self::Mmap(MmapRegion::new(page_count)?))
@@ -38,11 +45,13 @@ impl VirtualRegion {
 }
 
 /// Helper to construct a region honoring the exmap flag with graceful fallback.
-pub fn create_region(page_count: usize, use_exmap: bool) -> Result<(VirtualRegion, bool)> {
+pub fn create_region(page_count: usize, use_exmap: bool) -> Result<(VirtualRegion, RegionKind, Option<String>)> {
+    let mut reason = None;
     if use_exmap {
-        if let Ok(region) = VirtualRegion::exmap(page_count) {
-            return Ok((region, true));
+        match ExmapRegion::probe().and_then(|_| VirtualRegion::exmap(page_count)) {
+            Ok(region) => return Ok((region, RegionKind::Exmap, None)),
+            Err(e) => reason = Some(format!("{}", e)),
         }
     }
-    Ok((VirtualRegion::mmap(page_count)?, false))
+    Ok((VirtualRegion::mmap(page_count)?, RegionKind::Mmap, reason))
 }
