@@ -1,0 +1,598 @@
+use crate::config::Config;
+use crate::memory::{
+    page::Page,
+    page_state::{state, PageState},
+    MmapRegion,
+    ResidentPageSet,
+    PAGE_SIZE,
+};
+use crate::Result;
+use crate::io::PageIo;
+#[cfg(not(feature = "libaio"))]
+use crate::io::SyncFileIo;
+#[cfg(feature = "libaio")]
+use crate::io::lbaio::LibaioIo;
+use crate::Result as FerricResult;
+use crate::thread_local::{get_worker_id, set_worker_id};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Sender, Receiver};
+use std::collections::HashMap;
+use std::cell::Cell;
+
+/// Core buffer manager responsible for page lifecycle.
+///
+/// This is a skeleton; IO, eviction, and page fault handling will be filled in
+/// following the original vmcache design.
+pub struct BufferManager {
+    pub config: Config,
+    /// Total virtual memory size in bytes.
+    pub virt_size: u64,
+    /// Physical buffer size in bytes.
+    pub phys_size: u64,
+    /// Virtual pages count.
+    pub virt_count: u64,
+    /// Physical pages count (buffer pool size).
+    pub phys_count: u64,
+    /// Counter of pages currently mapped/used.
+    pub phys_used_count: AtomicU64,
+    /// Next PID to allocate (PID 0 reserved for metadata).
+    pub alloc_count: AtomicU64,
+    /// Access counters for stats.
+    pub read_count: AtomicU64,
+    pub write_count: AtomicU64,
+    /// Virtual memory region (mmap or exmap).
+    pub virt_region: MmapRegion,
+    /// Per-page state array.
+    pub page_state: Vec<PageState>,
+    /// Tracks currently resident pages for eviction.
+    pub resident_set: ResidentPageSet,
+    /// Eviction batch size.
+    pub batch: u64,
+    /// Page IO backend.
+    pub io: Arc<dyn PageIo>,
+    /// Simple free list for reclaimed page IDs.
+    pub free_list: Mutex<Vec<u64>>,
+    /// Background write toggle.
+    pub bg_write: bool,
+    /// Background writer handle (not used yet).
+    pub bg_handle: Option<std::thread::JoinHandle<()>>,
+    /// Channel to send background write tasks.
+    pub bg_tx: Option<Sender<BgRequest>>,
+    /// Tracking in-flight background writes.
+    pub bg_inflight: Mutex<HashMap<u64, Receiver<Result<()>>>>,
+    /// Optional per-worker stats.
+    pub worker_stats: Option<Arc<PerWorkerStats>>,
+    /// Allocator for worker ids.
+    pub worker_id_alloc: AtomicU64,
+}
+
+// Safety: BufferManager manages an mmap-backed region and internal atomics.
+// We rely on external synchronization (page states + guards) for correctness.
+unsafe impl Send for BufferManager {}
+unsafe impl Sync for BufferManager {}
+
+impl BufferManager {
+    pub fn new(config: Config) -> Result<Self> {
+        let virt_size = config.virt_gb * GB;
+        let phys_size = config.phys_gb * GB;
+        Self::new_with_sizes(config, virt_size, phys_size)
+    }
+
+    fn new_with_sizes(config: Config, virt_size: u64, phys_size: u64) -> Result<Self> {
+        if virt_size == 0 || phys_size == 0 {
+            return Err("virt/phys size must be > 0".into());
+        }
+        if virt_size < phys_size {
+            return Err("VIRTGB must be >= PHYSGB".into());
+        }
+        let virt_count = virt_size / PAGE_SIZE as u64;
+        let phys_count = phys_size / PAGE_SIZE as u64;
+        let batch = config.batch;
+
+        #[cfg(feature = "libaio")]
+        let io: Arc<dyn PageIo> = {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&config.block_path)?;
+            file.set_len(virt_size)?;
+            LibaioIo::open(file, 256)?
+        };
+        #[cfg(not(feature = "libaio"))]
+        let io: Arc<dyn PageIo> = SyncFileIo::open_with_len(&config.block_path, virt_size)?;
+
+        let virt_region = MmapRegion::new(
+            usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?,
+        )?;
+        let mut page_state = Vec::with_capacity(virt_count as usize);
+        for _ in 0..virt_count {
+            let ps = PageState::new();
+            ps.init_evicted();
+            page_state.push(ps);
+        }
+
+        let bg_write = config.bg_write;
+        let (bg_handle, bg_tx) = if bg_write {
+            let (tx, rx) = std::sync::mpsc::channel::<BgRequest>();
+            let io_clone = io.clone();
+            let handle = std::thread::spawn(move || {
+                Self::bg_worker(rx, io_clone);
+            });
+            (Some(handle), Some(tx))
+        } else {
+            (None, None)
+        };
+        let worker_stats = Some(Arc::new(PerWorkerStats::new(config.threads as usize)));
+        Ok(Self {
+            config,
+            virt_size,
+            phys_size,
+            virt_count,
+            phys_count,
+            phys_used_count: AtomicU64::new(0),
+            alloc_count: AtomicU64::new(1), // PID 0 reserved
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            virt_region,
+            page_state,
+            resident_set: ResidentPageSet::new(phys_count),
+            batch,
+            io,
+            free_list: Mutex::new(Vec::new()),
+            bg_write,
+            bg_handle,
+            bg_tx,
+            bg_inflight: Mutex::new(std::collections::HashMap::new()),
+            worker_stats,
+            worker_id_alloc: AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_with_pages(block_path: String, virt_pages: u64, phys_pages: u64, batch: u64) -> Result<Self> {
+        let mut cfg = Config::default();
+        cfg.block_path = block_path;
+        cfg.batch = batch;
+        let virt_size = virt_pages * PAGE_SIZE as u64;
+        let phys_size = phys_pages * PAGE_SIZE as u64;
+        Self::new_with_sizes(cfg, virt_size, phys_size)
+    }
+
+    /// Map PID to a page pointer.
+    pub fn to_ptr(&self, pid: u64) -> *mut Page {
+        assert!(pid < self.virt_count, "pid {} out of bounds", pid);
+        unsafe { self.virt_region.as_ptr().add(pid as usize) }
+    }
+
+    /// Attempt to map a page pointer back to PID.
+    pub fn to_pid(&self, ptr: *const Page) -> Option<u64> {
+        let base = self.virt_region.as_ptr() as usize;
+        let end = base + (self.virt_count as usize * PAGE_SIZE);
+        let p = ptr as usize;
+        if p < base || p >= end {
+            return None;
+        }
+        let delta = p - base;
+        Some((delta / PAGE_SIZE) as u64)
+    }
+
+    /// Check whether a pointer lies within the managed virtual region.
+    pub fn is_valid_ptr(&self, ptr: *const Page) -> bool {
+        self.to_pid(ptr).is_some()
+    }
+
+    /// Per-page state accessor.
+    #[inline]
+    pub fn page_state_ref(&self, pid: u64) -> &PageState {
+        &self.page_state[pid as usize]
+    }
+
+    /// Reserve a new page ID and mark it dirty.
+    pub fn alloc_page(&self) -> Result<u64> {
+        // reuse from free list if available
+        let pid = if let Some(pid) = self.free_list.lock().unwrap().pop() {
+            pid
+        } else {
+            self.alloc_count.fetch_add(1, Ordering::SeqCst)
+        };
+        if pid >= self.virt_count {
+            return Err("VIRTGB too low for allocation".into());
+        }
+        self.phys_used_count.fetch_add(1, Ordering::SeqCst);
+        self.ensure_free_pages();
+        unsafe {
+            (*self.to_ptr(pid)).dirty = true;
+        }
+        // Mark as locked to mimic allocation path; full fix/unfix will refine this.
+        let state = self.page_state_ref(pid).load();
+        let locked = self.page_state_ref(pid).try_lock_x(state);
+        if !locked {
+            return Err("failed to lock new page".into());
+        }
+        // Unlock immediately; alloc_page does not return a fixed pointer.
+        self.page_state_ref(pid).unlock_x();
+        self.resident_set.insert(pid);
+        Ok(pid)
+    }
+
+    /// Ensure there is free space; placeholder for future eviction hook.
+    pub fn ensure_free_pages(&self) {
+        if self.phys_used_count.load(Ordering::Relaxed) >= (self.phys_count as f64 * 0.95) as u64 {
+            self.evict();
+        }
+    }
+
+    /// Fix a page in exclusive (write) mode, handling faults.
+    pub fn fix_x(&self, pid: u64) -> *mut Page {
+        let ps = self.page_state_ref(pid);
+        loop {
+            let v = ps.load();
+            match PageState::state(v) {
+                crate::memory::page_state::state::EVICTED => {
+                    if ps.try_lock_x(v) {
+                        self.handle_fault(pid);
+                        unsafe { (*self.to_ptr(pid)).dirty = true; }
+                        return self.to_ptr(pid);
+                    }
+                }
+                crate::memory::page_state::state::MARKED | crate::memory::page_state::state::UNLOCKED => {
+                    if ps.try_lock_x(v) {
+                        unsafe { (*self.to_ptr(pid)).dirty = true; }
+                        return self.to_ptr(pid);
+                    }
+                }
+                _ => {}
+            }
+            spin();
+        }
+    }
+
+    /// Fix a page in shared (read) mode, handling faults.
+    pub fn fix_s(&self, pid: u64) -> *mut Page {
+        let ps = self.page_state_ref(pid);
+        loop {
+            let v = ps.load();
+            match PageState::state(v) {
+                crate::memory::page_state::state::LOCKED => {}
+                crate::memory::page_state::state::EVICTED => {
+                    if ps.try_lock_x(v) {
+                        self.handle_fault(pid);
+                        ps.unlock_x();
+                    }
+                }
+                _ => {
+                    if ps.try_lock_s(v) {
+                        return self.to_ptr(pid);
+                    }
+                }
+            }
+            spin();
+        }
+    }
+
+    pub fn unfix_s(&self, pid: u64) {
+        self.page_state_ref(pid).unlock_s();
+    }
+
+    pub fn unfix_x(&self, pid: u64) {
+        self.page_state_ref(pid).unlock_x();
+    }
+
+    /// Handle a page fault (read a page back into memory). IO is stubbed for now.
+    pub fn handle_fault(&self, pid: u64) {
+        self.phys_used_count.fetch_add(1, Ordering::SeqCst);
+        self.ensure_free_pages();
+        self.read_page(pid).expect("read_page failed");
+        self.resident_set.insert(pid);
+        self.read_count.fetch_add(1, Ordering::SeqCst);
+        self.stats_inc_read();
+        self.stats_inc_fault();
+    }
+
+    fn read_page(&self, pid: u64) -> Result<()> {
+        self.io.read_page(pid, self.to_ptr(pid))?;
+        unsafe { (*self.to_ptr(pid)).dirty = false; }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn write_page(&self, pid: u64) -> Result<()> {
+        self.io.write_page(pid, self.to_ptr(pid))?;
+        unsafe { (*self.to_ptr(pid)).dirty = false; }
+        self.write_count.fetch_add(1, Ordering::SeqCst);
+        self.stats_inc_write();
+        Ok(())
+    }
+
+    /// Evict up to `batch` pages using a clock-style second chance policy.
+    pub fn evict(&self) {
+        let batch = self.batch as usize;
+        let mut to_evict: Vec<u64> = Vec::with_capacity(batch);
+        let mut to_write: Vec<u64> = Vec::with_capacity(batch);
+        let mut scanned: u64 = 0;
+        let max_scan = self.resident_set.capacity();
+
+        // Phase 0: find candidates; first mark, then collect marked clean or lock S for dirty
+        while to_evict.len() + to_write.len() < batch {
+            let before = to_evict.len() + to_write.len();
+            let mut marked_progress = false;
+            self.resident_set.iterate_clock_batch(self.batch, |pid| {
+                if to_evict.len() + to_write.len() >= batch {
+                    return;
+                }
+                let ps = self.page_state_ref(pid);
+                let v = ps.load();
+                match PageState::state(v) {
+                    state::MARKED => {
+                        let dirty = unsafe { (*self.to_ptr(pid)).dirty };
+                        if dirty {
+                            if ps.try_lock_s(v) {
+                                to_write.push(pid);
+                            }
+                        } else {
+                            to_evict.push(pid);
+                        }
+                    }
+                    state::UNLOCKED => {
+                        if ps.try_mark(v) {
+                            marked_progress = true;
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            scanned += self.batch;
+            if self.phys_used_count.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            let after = to_evict.len() + to_write.len();
+            if after == before && !marked_progress && scanned >= max_scan {
+                break;
+            }
+        }
+
+        // Phase 1: write dirty pages (still S-locked)
+        if !to_write.is_empty() {
+            if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
+                eprintln!("batch write error: {}", e);
+                // fallback per-page
+                for &pid in &to_write {
+                    if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
+                        eprintln!("write_page fallback error pid {}: {}", pid, e2);
+                        self.page_state_ref(pid).unlock_s();
+                    } else {
+                        self.stats_inc_write();
+                    }
+                }
+            } else {
+                // clear dirty flags on success
+                for &pid in &to_write {
+                    unsafe { (*self.to_ptr(pid)).dirty = false; }
+                    self.write_count.fetch_add(1, Ordering::SeqCst);
+                    self.stats_inc_write();
+                }
+            }
+        }
+
+        // Phase 2: lock clean candidates (currently MARKED)
+        to_evict.retain(|&pid| {
+            let ps = self.page_state_ref(pid);
+            let v = ps.load();
+            PageState::state(v) == state::MARKED && ps.try_lock_x(v)
+        });
+
+        // Phase 3: upgrade dirty candidates (currently S-locked) to X
+        for pid in to_write {
+            let ps = self.page_state_ref(pid);
+            let v = ps.load();
+            if PageState::state(v) == 1 && ps.try_lock_x(v) {
+                to_evict.push(pid);
+            } else {
+                ps.unlock_s();
+            }
+        }
+
+        // Phase 4: free pages (madvise/dontneed) and remove from resident set
+        for pid in to_evict {
+            let removed = self.resident_set.remove(pid);
+            debug_assert!(removed);
+            self.page_state_ref(pid).unlock_x_evicted();
+            self.phys_used_count.fetch_sub(1, Ordering::SeqCst);
+            self.stats_inc_evict();
+            unsafe {
+                libc::madvise(self.to_ptr(pid) as *mut libc::c_void, PAGE_SIZE, libc::MADV_DONTNEED);
+            }
+        }
+    }
+
+    /// Return a page ID to the free list (caller ensures it's safe).
+    pub fn free_page(&self, pid: u64) {
+        if pid == 0 {
+            return;
+        }
+        self.free_list.lock().unwrap().push(pid);
+    }
+
+    /// Acquire and set a worker id for the current thread (0-based).
+    /// Threads beyond configured count will reuse modulo threads for stats.
+    pub fn register_worker(&self) -> u16 {
+        let id = self.worker_id_alloc.fetch_add(1, Ordering::Relaxed) as u16;
+        let normalized = if self.config.threads == 0 {
+            id
+        } else {
+            id % self.config.threads as u16
+        };
+        set_worker_id(normalized);
+        normalized
+    }
+
+}
+
+const GB: u64 = 1024 * 1024 * 1024;
+
+#[inline]
+fn spin() {
+    thread_local! {
+        static SPIN_COUNTER: Cell<u32> = Cell::new(0);
+    }
+    SPIN_COUNTER.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        if v & 0x3FF == 0 {
+            // Occasionally sleep a little to reduce contention under heavy spin.
+            std::thread::sleep(std::time::Duration::from_nanos(50));
+        } else if v & 0x7F == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    });
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct WorkerStats {
+    pub reads: u64,
+    pub writes: u64,
+    pub faults: u64,
+    pub evicts: u64,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct StatsSnapshot {
+    pub reads: u64,
+    pub writes: u64,
+    pub phys_used: u64,
+    pub alloc: u64,
+    pub worker: Option<Vec<WorkerStats>>,
+}
+
+pub struct PerWorkerStats {
+    reads: Vec<AtomicU64>,
+    writes: Vec<AtomicU64>,
+    faults: Vec<AtomicU64>,
+    evicts: Vec<AtomicU64>,
+}
+
+impl PerWorkerStats {
+    fn new(workers: usize) -> Self {
+        let make_vec = |size: usize| -> Vec<AtomicU64> {
+            (0..size).map(|_| AtomicU64::new(0)).collect()
+        };
+        Self {
+            reads: make_vec(workers),
+            writes: make_vec(workers),
+            faults: make_vec(workers),
+            evicts: make_vec(workers),
+        }
+    }
+
+    fn inc(reads: &Vec<AtomicU64>, writes: &Vec<AtomicU64>, faults: &Vec<AtomicU64>, evicts: &Vec<AtomicU64>, idx: usize, kind: StatKind) {
+        if idx >= reads.len() {
+            return;
+        }
+        match kind {
+            StatKind::Read => {
+                reads[idx].fetch_add(1, Ordering::Relaxed);
+            }
+            StatKind::Write => {
+                writes[idx].fetch_add(1, Ordering::Relaxed);
+            }
+            StatKind::Fault => {
+                faults[idx].fetch_add(1, Ordering::Relaxed);
+            }
+            StatKind::Evict => {
+                evicts[idx].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<WorkerStats> {
+        let mut out = Vec::with_capacity(self.reads.len());
+        for i in 0..self.reads.len() {
+            out.push(WorkerStats {
+                reads: self.reads[i].load(Ordering::Relaxed),
+                writes: self.writes[i].load(Ordering::Relaxed),
+                faults: self.faults[i].load(Ordering::Relaxed),
+                evicts: self.evicts[i].load(Ordering::Relaxed),
+            });
+        }
+        out
+    }
+}
+
+enum StatKind {
+    Read,
+    Write,
+    Fault,
+    Evict,
+}
+
+/// Background write request: pid and a completion tx.
+pub type BgRequest = (u64, Sender<FerricResult<()>>);
+
+impl BufferManager {
+    /// Background writer thread: receives write requests and completes them.
+    fn bg_worker(rx: Receiver<BgRequest>, io: Arc<dyn PageIo>) {
+        while let Ok((pid, tx)) = rx.recv() {
+            // In this simple model we don't have page pointer; caller gives base.
+            // We expect pid to be already mapped; caller provides a virtual base at pid offset 0.
+            // To avoid unsafe cross-thread access, we only accept requests with a raw buffer copy.
+            // For now, signal error to encourage safe path.
+            let _ = tx.send(Err("bg_worker unimplemented buffer path".into()));
+            let _ = pid; // silence unused warning if build skips bg_write
+            let _ = &io;
+        }
+    }
+    fn stat_index(&self) -> Option<usize> {
+        let id = get_worker_id() as usize;
+        self.worker_stats.as_ref().and_then(|stats| {
+            if id < stats.reads.len() {
+                Some(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn stats_inc_read(&self) {
+        if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
+            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Read);
+        }
+    }
+
+    fn stats_inc_write(&self) {
+        if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
+            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Write);
+        }
+    }
+
+    fn stats_inc_fault(&self) {
+        if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
+            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Fault);
+        }
+    }
+
+    fn stats_inc_evict(&self) {
+        if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
+            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Evict);
+        }
+    }
+
+    /// Snapshot per-worker counters (if enabled).
+    pub fn worker_stats(&self) -> Option<Vec<WorkerStats>> {
+        self.worker_stats.as_ref().map(|s| s.snapshot())
+    }
+
+    /// Aggregate global + per-worker stats.
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            reads: self.read_count.load(Ordering::Relaxed),
+            writes: self.write_count.load(Ordering::Relaxed),
+            phys_used: self.phys_used_count.load(Ordering::Relaxed),
+            alloc: self.alloc_count.load(Ordering::Relaxed),
+            worker: self.worker_stats(),
+        }
+    }
+}
