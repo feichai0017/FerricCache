@@ -145,15 +145,33 @@ mod lbaio_impl {
                 cb_ptrs.push(cb as *mut _);
             }
             let mut submitted = 0usize;
+            let mut retries = 0;
             while submitted < cb_ptrs.len() {
                 let ptr = unsafe { cb_ptrs.as_mut_ptr().add(submitted) };
-                let ret = io_submit(self.ctx, unsafe {
-                    std::slice::from_raw_parts_mut(ptr, cb_ptrs.len() - submitted)
-                })?;
-                if ret == 0 {
-                    break;
+                let to_submit = cb_ptrs.len() - submitted;
+                match io_submit(self.ctx, unsafe {
+                    std::slice::from_raw_parts_mut(ptr, to_submit)
+                }) {
+                    Ok(ret) if ret == 0 => {
+                        // nothing submitted; avoid tight loop
+                        if retries > 3 {
+                            break;
+                        }
+                        retries += 1;
+                        continue;
+                    }
+                    Ok(ret) => {
+                        submitted += ret;
+                        retries = 0;
+                    }
+                    Err(e) => {
+                        // fallback to per-page writes for remaining
+                        for &pid in &pids[submitted..] {
+                            self.write_page(pid, unsafe { base.add(pid as usize) })?;
+                        }
+                        return Err(e);
+                    }
                 }
-                submitted += ret;
             }
 
             if submitted == 0 {

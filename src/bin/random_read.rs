@@ -66,10 +66,12 @@ fn main() -> ferric_cache::Result<()> {
 
     let mut total_ops = 0u64;
     let mut max_time_us = 0u64;
+    let mut per_thread: Vec<(u64, u64)> = Vec::with_capacity(handles.len());
     for h in handles {
         let (ops, time_us) = h.join().unwrap()?;
         total_ops += ops;
         max_time_us = max_time_us.max(time_us);
+        per_thread.push((ops, time_us));
     }
 
     let stats = bm.stats_snapshot();
@@ -83,5 +85,15 @@ fn main() -> ferric_cache::Result<()> {
         stats.worker.as_ref().map(|w| w.iter().map(|s| s.evicts).sum::<u64>()).unwrap_or(0),
         stats.worker.as_ref().map(|w| w.iter().map(|s| s.writes).sum::<u64>()).unwrap_or(0),
     );
+    for (i, (ops, time_us)) in per_thread.iter().enumerate() {
+        let tput = if *time_us == 0 { 0.0 } else { *ops as f64 / (*time_us as f64 / 1_000_000.0) };
+        println!("thread {}: ops={}, throughput={:.2} ops/s", i, ops, tput);
+    }
+    if let Some(bg) = stats.bgwrite {
+        println!(
+            "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}",
+            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors
+        );
+    }
     Ok(())
 }

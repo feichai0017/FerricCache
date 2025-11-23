@@ -14,10 +14,10 @@ use crate::io::SyncFileIo;
 use crate::io::lbaio::LibaioIo;
 use crate::Result as FerricResult;
 use crate::thread_local::{get_worker_id, set_worker_id};
+use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver};
-use std::collections::HashMap;
 use std::cell::Cell;
 
 /// Core buffer manager responsible for page lifecycle.
@@ -58,9 +58,9 @@ pub struct BufferManager {
     /// Background writer handle (not used yet).
     pub bg_handle: Option<std::thread::JoinHandle<()>>,
     /// Channel to send background write tasks.
-    pub bg_tx: Option<Sender<BgRequest>>,
-    /// Tracking in-flight background writes.
-    pub bg_inflight: Mutex<HashMap<u64, Receiver<Result<()>>>>,
+    pub bg_tx: Option<CbSender<BgRequest>>,
+    /// BGWRITE stats.
+    pub bg_stats: Arc<BgStats>,
     /// Optional per-worker stats.
     pub worker_stats: Option<Arc<PerWorkerStats>>,
     /// Allocator for worker ids.
@@ -114,11 +114,13 @@ impl BufferManager {
         }
 
         let bg_write = config.bg_write;
+        let bg_stats = Arc::new(BgStats::default());
         let (bg_handle, bg_tx) = if bg_write {
-            let (tx, rx) = std::sync::mpsc::channel::<BgRequest>();
+            let (tx, rx) = crossbeam_channel::bounded::<BgRequest>(batch as usize * 2 + 1);
             let io_clone = io.clone();
+            let stats_clone = bg_stats.clone();
             let handle = std::thread::spawn(move || {
-                Self::bg_worker(rx, io_clone);
+                Self::bg_worker(rx, io_clone, stats_clone);
             });
             (Some(handle), Some(tx))
         } else {
@@ -144,7 +146,7 @@ impl BufferManager {
             bg_write,
             bg_handle,
             bg_tx,
-            bg_inflight: Mutex::new(std::collections::HashMap::new()),
+            bg_stats,
             worker_stats,
             worker_id_alloc: AtomicU64::new(0),
         })
@@ -311,6 +313,7 @@ impl BufferManager {
         let batch = self.batch as usize;
         let mut to_evict: Vec<u64> = Vec::with_capacity(batch);
         let mut to_write: Vec<u64> = Vec::with_capacity(batch);
+        let mut bg_wait: Vec<(u64, Receiver<FerricResult<()>>)> = Vec::with_capacity(batch);
         let mut scanned: u64 = 0;
         let max_scan = self.resident_set.capacity();
 
@@ -355,23 +358,91 @@ impl BufferManager {
 
         // Phase 1: write dirty pages (still S-locked)
         if !to_write.is_empty() {
-            if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
-                eprintln!("batch write error: {}", e);
-                // fallback per-page
+            if self.bg_write {
                 for &pid in &to_write {
-                    if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
-                        eprintln!("write_page fallback error pid {}: {}", pid, e2);
-                        self.page_state_ref(pid).unlock_s();
+                    let ps = self.page_state_ref(pid);
+                    let buf = unsafe {
+                        std::slice::from_raw_parts(self.to_ptr(pid) as *const u8, PAGE_SIZE).to_vec()
+                    };
+                    if let Some(tx) = &self.bg_tx {
+                        let (done_tx, done_rx) = std::sync::mpsc::channel();
+                        // try to enqueue; if full or closed, fall back to sync write
+                        let mut sent = false;
+                        for _ in 0..3 {
+                            match tx.try_send(BgRequest { pid, buf: buf.clone(), done: done_tx.clone() }) {
+                                Ok(_) => {
+                                    self.bg_stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                                    bg_wait.push((pid, done_rx));
+                                    sent = true;
+                                    break;
+                                }
+                                Err(TrySendError::Full(_)) => {
+                                    self.bg_stats.saturated.fetch_add(1, Ordering::Relaxed);
+                                    std::thread::sleep(std::time::Duration::from_micros(50));
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    eprintln!("bgwrite channel closed, falling back to sync");
+                                    break;
+                                }
+                            }
+                        }
+                        if sent {
+                            continue;
+                        }
+                    }
+                    // fallback sync if send fails
+                    if let Err(e) = self.io.write_page(pid, self.to_ptr(pid)) {
+                        eprintln!("sync write fallback error pid {}: {}", pid, e);
+                        ps.unlock_s();
                     } else {
+                        self.bg_stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
                     }
                 }
             } else {
-                // clear dirty flags on success
-                for &pid in &to_write {
-                    unsafe { (*self.to_ptr(pid)).dirty = false; }
-                    self.write_count.fetch_add(1, Ordering::SeqCst);
-                    self.stats_inc_write();
+                if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
+                    eprintln!("batch write error: {}", e);
+                    // fallback per-page
+                    for &pid in &to_write {
+                        if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
+                            eprintln!("write_page fallback error pid {}: {}", pid, e2);
+                            self.page_state_ref(pid).unlock_s();
+                        } else {
+                            unsafe { (*self.to_ptr(pid)).dirty = false; }
+                            self.write_count.fetch_add(1, Ordering::SeqCst);
+                            self.stats_inc_write();
+                        }
+                    }
+                } else {
+                    // clear dirty flags on success
+                    for &pid in &to_write {
+                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        self.write_count.fetch_add(1, Ordering::SeqCst);
+                        self.stats_inc_write();
+                    }
+                }
+            }
+        }
+
+        // Wait for background writes (if any)
+        if self.bg_write {
+            for (pid, rx) in bg_wait {
+                let res = rx.recv().unwrap_or_else(|_| Err("bgwrite channel closed".into()));
+                match res {
+                    Ok(()) => {
+                        self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
+                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        self.write_count.fetch_add(1, Ordering::SeqCst);
+                        self.stats_inc_write();
+                    }
+                    Err(e) => {
+                        eprintln!("bgwrite error pid {}: {}", pid, e);
+                        self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
+                        // try sync fallback
+                        let _ = self.io.write_page(pid, self.to_ptr(pid));
+                    }
                 }
             }
         }
@@ -466,6 +537,7 @@ pub struct StatsSnapshot {
     pub phys_used: u64,
     pub alloc: u64,
     pub worker: Option<Vec<WorkerStats>>,
+    pub bgwrite: Option<BgStatsSnapshot>,
 }
 
 pub struct PerWorkerStats {
@@ -473,6 +545,17 @@ pub struct PerWorkerStats {
     writes: Vec<AtomicU64>,
     faults: Vec<AtomicU64>,
     evicts: Vec<AtomicU64>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct BgStatsSnapshot {
+    pub enqueued: u64,
+    pub completed: u64,
+    pub saturated: u64,
+    pub fallback_sync: u64,
+    pub errors: u64,
+    pub batches: u64,
+    pub max_batch: u64,
 }
 
 impl PerWorkerStats {
@@ -529,20 +612,108 @@ enum StatKind {
     Evict,
 }
 
-/// Background write request: pid and a completion tx.
-pub type BgRequest = (u64, Sender<FerricResult<()>>);
+/// Background write request: pid, page copy, and completion tx.
+pub struct BgRequest {
+    pub pid: u64,
+    pub buf: Vec<u8>,
+    pub done: Sender<FerricResult<()>>,
+}
+
+#[derive(Default, Debug)]
+pub struct BgStats {
+    pub enqueued: AtomicU64,
+    pub completed: AtomicU64,
+    pub saturated: AtomicU64,
+    pub fallback_sync: AtomicU64,
+    pub errors: AtomicU64,
+    pub batches: AtomicU64,
+    pub max_batch: AtomicU64,
+}
 
 impl BufferManager {
-    /// Background writer thread: receives write requests and completes them.
-    fn bg_worker(rx: Receiver<BgRequest>, io: Arc<dyn PageIo>) {
-        while let Ok((pid, tx)) = rx.recv() {
-            // In this simple model we don't have page pointer; caller gives base.
-            // We expect pid to be already mapped; caller provides a virtual base at pid offset 0.
-            // To avoid unsafe cross-thread access, we only accept requests with a raw buffer copy.
-            // For now, signal error to encourage safe path.
-            let _ = tx.send(Err("bg_worker unimplemented buffer path".into()));
-            let _ = pid; // silence unused warning if build skips bg_write
-            let _ = &io;
+    /// Background writer thread: receives page copies and writes them out.
+    fn bg_worker(rx: CbReceiver<BgRequest>, io: Arc<dyn PageIo>, stats: Arc<BgStats>) {
+        let mut batch = Vec::with_capacity(64);
+        loop {
+            batch.clear();
+            // blocking receive for first item
+            let first = match rx.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            };
+            batch.push(first);
+            // try to drain additional items without blocking
+            while let Ok(req) = rx.try_recv() {
+                batch.push(req);
+                if batch.len() >= 64 {
+                    break;
+                }
+            }
+
+            // If only one, do single write_buf to avoid batch overhead
+            let batch_len = batch.len();
+            if batch_len == 1 {
+                let req = batch.pop().unwrap();
+                let res = io.write_buf(req.pid, &req.buf);
+                let _ = req.done.send(res);
+                stats.completed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Batch write using contiguous buffers is not available; write_pages on pids order.
+            // We sort by pid to improve sequential IO locality.
+            batch.sort_by_key(|r| r.pid);
+            // Try batch write_pages when buffers are page sized and contiguous in memory order of pids.
+            let first_pid = batch.first().map(|r| r.pid).unwrap_or(0);
+            let mut contiguous = true;
+            for (idx, req) in batch.iter().enumerate() {
+                if req.pid != first_pid + idx as u64 {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if contiguous {
+                // allocate temporary contiguous buffer to pass to write_pages
+                let mut tmp = Vec::with_capacity(batch_len * PAGE_SIZE);
+                for req in &batch {
+                    tmp.extend_from_slice(&req.buf);
+                }
+                let base_ptr = tmp.as_ptr() as *const Page;
+                let pid_list: Vec<u64> = (0..batch_len).map(|i| first_pid + i as u64).collect();
+                let res = io.write_pages(&pid_list, base_ptr);
+                for req in batch.drain(..) {
+                    let _ = req.done.send(res.as_ref().map(|_| ()).map_err(|e| {
+                        let msg = format!("{}", e);
+                        msg.into()
+                    }));
+                    if res.is_ok() {
+                        stats.completed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                let mut first_err: Option<FerricResult<()>> = None;
+                for req in &batch {
+                    let res = io.write_buf(req.pid, &req.buf);
+                    if let Err(e) = &res {
+                        if first_err.is_none() {
+                            first_err = Some(Err(e.to_string().into()));
+                        }
+                    }
+                }
+                for req in batch.drain(..) {
+                    if let Some(Err(ref e)) = first_err {
+                        let _ = req.done.send(Err(e.to_string().into()));
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let _ = req.done.send(Ok(()));
+                        stats.completed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            stats.batches.fetch_add(1, Ordering::Relaxed);
+            stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
         }
     }
     fn stat_index(&self) -> Option<usize> {
@@ -585,7 +756,22 @@ impl BufferManager {
         self.worker_stats.as_ref().map(|s| s.snapshot())
     }
 
-    /// Aggregate global + per-worker stats.
+    /// BGWRITE stats helper.
+    pub fn bg_stats_snapshot(&self) -> Option<BgStatsSnapshot> {
+        if !self.bg_write {
+            return None;
+        }
+        Some(BgStatsSnapshot {
+            enqueued: self.bg_stats.enqueued.load(Ordering::Relaxed),
+            completed: self.bg_stats.completed.load(Ordering::Relaxed),
+            saturated: self.bg_stats.saturated.load(Ordering::Relaxed),
+            fallback_sync: self.bg_stats.fallback_sync.load(Ordering::Relaxed),
+            errors: self.bg_stats.errors.load(Ordering::Relaxed),
+            batches: self.bg_stats.batches.load(Ordering::Relaxed),
+            max_batch: self.bg_stats.max_batch.load(Ordering::Relaxed),
+        })
+    }
+
     pub fn stats_snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             reads: self.read_count.load(Ordering::Relaxed),
@@ -593,6 +779,7 @@ impl BufferManager {
             phys_used: self.phys_used_count.load(Ordering::Relaxed),
             alloc: self.alloc_count.load(Ordering::Relaxed),
             worker: self.worker_stats(),
+            bgwrite: self.bg_stats_snapshot(),
         }
     }
 }
