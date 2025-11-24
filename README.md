@@ -39,6 +39,21 @@ A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer 
 - `tests`: PageState invariants, eviction order/pressure, B+Tree CRUD/merge, BGWRITE config, worker_id stats.
 - Optional C ABI (enable feature `capi`): `ferric_init/destroy/alloc_page/fix_s/fix_x/unfix/mark_dirty/evict/poll_bg/stats` exported as `extern "C"` with POD config/stats structs mirroring VMCache knobs.
 
+### BGWRITE/IO stats fields
+- `bg_enqueued/completed/errors/errors_enospc/errors_eio`: background writes submitted, completed, and failures by errno.
+- `bg_queue_len/inflight/retries/wait_park`: current queue length, in-flight writes, retry count, and times eviction/BG waited on inflight saturation.
+- `io_submit/fail/timeout/retries`: aggregated per-queue submit/fail/timeout/retry counters (libaio path).
+- `exmap_requested/active`: whether EXMAP was requested and actually active.
+
+## C API usage
+- Build the shared library: `cargo build --release --features "capi"` (add `libaio` if desired).
+- Header: `include/ferric.h` lists config/stats structs and exported symbols.
+- Minimal example: see `examples/capi_example.c`. Compile with something like:
+  ```bash
+  gcc -Iinclude -Ltarget/release -lferric_cache examples/capi_example.c -o capi_example
+  LD_LIBRARY_PATH=target/release ./capi_example
+  ```
+
 ## How it works (pipeline sketch)
 1) **Fix/Fault**: `fix_s/fix_x` check `PageState`; if evicted, fault in (pread/exmap alloc), mark dirty on first write, stats per worker.
 2) **Eviction**: Clock over resident set in batches → mark unlocked → clean -> X lock -> evict (madvise) or dirty -> S lock -> enqueue BGWRITE (or sync write). BGWRITE tracks inflight, queues, retries, error grades; completions notify condvars to unblock eviction.
