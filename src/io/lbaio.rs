@@ -212,9 +212,7 @@ mod lbaio_impl {
                             let _ = self.write_page(*pid, ptr);
                         }
                         let raw = e.raw_os_error();
-                        let err = raw
-                            .map(io::Error::from_raw_os_error)
-                            .unwrap_or(e);
+                        let err = raw.map(io::Error::from_raw_os_error).unwrap_or(e);
                         let _ = req.done.send(Err(err));
                         self.queue_stats[req.queue_idx]
                             .fail
@@ -467,7 +465,9 @@ mod lbaio_impl {
                         }
                     }
                 }
-                return Err(first_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO).into()));
+                return Err(
+                    first_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO).into())
+                );
             }
             Ok(())
         }
