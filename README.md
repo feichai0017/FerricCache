@@ -50,8 +50,8 @@ A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer 
 - Header: `include/ferric.h` lists config/stats structs and exported symbols.
 - Minimal example: see `examples/capi_example.c`. Compile with something like:
   ```bash
-  gcc -Iinclude -Ltarget/release -lferric_cache examples/capi_example.c -o capi_example
-  LD_LIBRARY_PATH=target/release ./capi_example
+  scripts/build_capi_example.sh
+  LD_LIBRARY_PATH=target/release ./examples/capi_example
   ```
 
 ## How it works (pipeline sketch)
