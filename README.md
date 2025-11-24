@@ -1,51 +1,59 @@
 # FerricCache
 
-Rust 版 VMCache（SIGMOD’23 “Virtual-Memory Assisted Buffer Management”）实现，保持与上游 VMCache 语义一致，同时用安全的 Rust 包装、可观测性和可测性。参考上游项目：https://github.com/tuhhosg/vmcache
+A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer Management)](https://github.com/tuhhosg/vmcache). Same knobs and CSV output as upstream, but with safe Rust, clearer observability, and tests.
 
-## 快速开始
-- 依赖：Rust stable，`libaio-dev`（开启 `libaio` 功能时），Linux x86_64。
-- 构建：`cargo build --release`（默认 mmap + 同步 IO）。
-- 运行 TPCC：`RUNFOR=30 THREADS=1 DATASIZE=10 PHYSGB=4 VIRTGB=16 BGWRITE=0 cargo run --release --bin bench`
-- 运行随机读：`RNDREAD=1 DATASIZE=1e6 THREADS=8 RUNFOR=30 cargo run --release --bin bench`
-- 对齐 VMCache 输出：bench 每秒打印 `ts,tx,rmb,wmb,system,threads,datasize,workload,batch`，便于与上游 CSV 逐行对比。
+## Quickstart
+- Prereqs: Rust stable on Linux x86_64. Install `libaio-dev` if you enable the `libaio` feature.
+- Build: `cargo build --release` (defaults to mmap + sync IO).
+- TPCC example:  
+  `RUNFOR=30 THREADS=1 DATASIZE=10 PHYSGB=4 VIRTGB=16 BGWRITE=0 cargo run --release --bin bench`
+- Random read:  
+  `RNDREAD=1 DATASIZE=1e6 THREADS=8 RUNFOR=30 cargo run --release --bin bench`
+- Output matches VMCache CSV: `ts,tx,rmb,wmb,system,threads,datasize,workload,batch` (per-second deltas).
 
-## 配置（环境变量）
-- `BLOCK`：块设备或文件路径，默认 `/tmp/bm`
-- `VIRTGB`：虚拟内存大小（GB），默认 16
-- `PHYSGB`：物理缓存大小（GB），默认 4
-- `EXMAP`：非零则尝试 exmap 区域（当前若不可用会回退 mmap）
-- `BATCH`：驱逐批大小（页），默认 64
-- `RUNFOR`：基准运行时间（秒），默认 30
-- `THREADS`：线程数，默认 1
-- `DATASIZE`：TPCC 仓库数或随机读键数，默认 10
-- `RNDREAD`：非零运行随机读，否则 TPCC
-- `BGWRITE`：启用背景写，默认 0（关闭）
-- `BGW_THREADS`：背景写 worker 数，默认 1
-- `IODEPTH`：libaio 深度，默认 256
-- `IO_WORKERS`：libaio 队列数，默认 1
-- `IO_AFFINITY`：可选 CPU 亲和列表（逗号分隔），仅在 libaio 下最佳努力绑定
-- `STATS_INTERVAL_SECS`：bench 打印间隔，默认 1 秒
-- `STATS_CSV`：若设置则追加 CSV 日志（含 BGWRITE/EXMAP 信息）
+## Configuration (env)
+- `BLOCK` `/tmp/bm` — block device/file path
+- `VIRTGB` `16` — virtual memory size (GB)
+- `PHYSGB` `4` — buffer pool size (GB)
+- `EXMAP` `0` — non-zero to request exmap (falls back to mmap if unavailable)
+- `BATCH` `64` — eviction batch size (pages)
+- `RUNFOR` `30` — benchmark duration (seconds)
+- `THREADS` `1` — worker threads
+- `DATASIZE` `10` — TPCC warehouses or random-read keys
+- `RNDREAD` `0` — non-zero to run random-read instead of TPCC
+- `BGWRITE` `0` — enable background write
+- `BGW_THREADS` `1` — background write workers
+- `IODEPTH` `256` — libaio depth
+- `IO_WORKERS` `1` — libaio queues
+- `IO_AFFINITY` — optional CPU list (comma-separated), best-effort bind for libaio
+- `STATS_INTERVAL_SECS` `1` — bench print interval
+- `STATS_CSV` — append stats CSV (includes BGWRITE/EXMAP)
 
-## 主要特性
-- 缓冲区管理：`PageState` 状态机，Clock 驱逐，批量写出，mmap 区域或 exmap 探测回退。
-- IO：同步 pread/pwrite；`libaio` 功能下支持多队列异步提交、队列统计、errno 分级（EAGAIN/ETIMEDOUT/EIO/ENOSPC）和重试/回退。
-- 驱逐/写出协同：BGWRITE 队列 + inflight 计数，饱和时驱逐线程 park，完成时 notify；批量/单页写并分类错误。
-- 并发：乐观/共享/独占 Guard，自旋+周期性 wait/notify，worker_id 线程局部用于 IO 队列选择。
-- B+Tree：vmcache 风格节点布局，插入/扫描/删除，借/合并，根 PID 保持。
-- 基准：TPCC 简化版与随机读，输出与 VMCache 对齐的 CSV，附带 BGWRITE/IO 队列统计。
-- 测试：覆盖 PageState、驱逐顺序、B+Tree CRUD/压力、BGWRITE 配置、worker_id 统计等。
+## Architecture
+- `config`: environment-driven knobs shared with VMCache.
+- `memory`: `Page`, `PageState` (atomic state+version), `ResidentPageSet` (clock), virtual region (mmap; exmap detection/fallback).
+- `buffer_manager`: owns region/state/resident set; fix/unfix S/X, fault/alloc, batched eviction, IO submission, per-thread stats, BGWRITE queue + inflight counters, error grading (EAGAIN/ETIMEDOUT/EIO/ENOSPC).
+- `io`: sync pread/pwrite; optional libaio multi-queue async with per-queue stats and retries.
+- `btree`: VMCache-style node layout (prefix/fence/hints), optimistic/shared/exclusive guards, split/merge, root PID tracking.
+- `bench`: TPCC-lite and random-read; VMCache-compatible CSV + optional BGWRITE/IO queue stats; periodic stats thread.
+- `tests`: PageState invariants, eviction order/pressure, B+Tree CRUD/merge, BGWRITE config, worker_id stats.
 
-## 与 VMCache 的差异
-- exmap 模式：当前仅检测/回退，未接入 exmap ioctl 与 fault 处理。
-- IO/NUMA：队列选择按 worker_id 取模，亲和是最佳努力；尚未做专属队列/NUMA 绑定和优先级。
-- 锁与等待：已增加 wait/notify，但深度饥饿处理仍可优化。
-- 存储管理：无 free-space/WAL/检查点（上游也留空）。
+## How it works (pipeline sketch)
+1) **Fix/Fault**: `fix_s/fix_x` check `PageState`; if evicted, fault in (pread/exmap alloc), mark dirty on first write, stats per worker.
+2) **Eviction**: Clock over resident set in batches → mark unlocked → clean -> X lock -> evict (madvise) or dirty -> S lock -> enqueue BGWRITE (or sync write). BGWRITE tracks inflight, queues, retries, error grades; completions notify condvars to unblock eviction.
+3) **IO**: Sync pread/pwrite by default; libaio path batches, binds queue by `worker_id` modulo queues, tracks submit/fail/timeout/retry; errno preserved for grading.
+4) **Concurrency**: Guards (O/S/X) with spin/yield and periodic wait/notify; `worker_id` thread-local for IO selection and stats.
 
-## 开发提示
-- 启用 libaio：`cargo build --release --features libaio`
-- 运行测试：`cargo test`
-- 对比上游：`.vmcache_upstream/` 可直接 `make && THREADS=... ./vmcache`，与本项目 bench 同配置对比 CSV。
+## Differences vs VMCache
+- Exmap path: only detect/rollback today; ioctl + fault handling not wired yet.
+- IO/NUMA: queue choice is worker_id % queues; affinity is best-effort, no dedicated/NUMA-aware queues or priorities yet.
+- Locks: wait/notify added, but long-wait starvation handling can be improved.
+- Storage: no free-space/WAL/checkpoint (upstream also leaves open).
 
-## 许可
+## Dev tips
+- Enable libaio: `cargo build --release --features libaio`
+- Run tests: `cargo test`
+- Upstream comparison: build `.vmcache_upstream` with `make`; run `THREADS=... ./vmcache` and compare CSV to this bench under the same env.
+
+## License
 MIT
