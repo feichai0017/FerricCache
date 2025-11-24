@@ -1,6 +1,6 @@
 # FerricCache
 
-A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer Management)](https://github.com/tuhhosg/vmcache). Same knobs and CSV output as upstream, but with safe Rust, clearer observability, and tests.
+A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer Management)](https://github.com/viktorleis/vmcache). Same knobs and CSV output as upstream, but with safe Rust, clearer observability, and tests.
 
 ## Quickstart
 - Prereqs: Rust stable on Linux x86_64. Install `libaio-dev` if you enable the `libaio` feature.
