@@ -194,6 +194,8 @@ fn spin() {
         c.set(v);
         if v & 0x3FF == 0 {
             std::thread::sleep(std::time::Duration::from_nanos(50));
+        } else if v & 0x7FFF == 0 {
+            std::thread::park_timeout(std::time::Duration::from_micros(10));
         } else if v & 0x7F == 0 {
             std::thread::yield_now();
         } else {

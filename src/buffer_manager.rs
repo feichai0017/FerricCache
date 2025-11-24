@@ -61,6 +61,8 @@ pub struct BufferManager {
     pub io_inflight_count: Arc<AtomicU64>,
     /// Condvar to park/unpark when inflight is saturated.
     pub io_inflight_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
+    /// Condvar to park/unpark eviction when IO inflight is high.
+    pub evict_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
     /// Simple free list for reclaimed page IDs.
     pub free_list: Mutex<Vec<u64>>,
     /// Background write toggle.
@@ -139,17 +141,19 @@ impl BufferManager {
         let bg_stats = Arc::new(BgStats::default());
         let io_inflight_count = Arc::new(AtomicU64::new(0));
         let io_inflight_cv = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
+        let evict_cv = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
         let (bg_handle, bg_tx) = if bg_write {
             let (tx, rx) = crossbeam_channel::bounded::<BgRequest>(batch as usize * 2 + 1);
             let stats_clone = bg_stats.clone();
             let inflight_clone = io_inflight_count.clone();
             let inflight_cv_clone = io_inflight_cv.clone();
+            let evict_cv_clone = evict_cv.clone();
             // Dedicated IO context for background writes (libaio if enabled, else sync).
             let bg_io = Self::make_io_for_bg(&config, virt_size)?;
             let bg_worker_id = if config.threads > 0 { config.threads as u16 } else { 0 };
             let handle = std::thread::spawn(move || {
                 set_worker_id(bg_worker_id);
-                Self::bg_worker(rx, bg_io, stats_clone, inflight_clone, inflight_cv_clone, config.io_depth);
+                Self::bg_worker(rx, bg_io, stats_clone, inflight_clone, inflight_cv_clone, evict_cv_clone, config.io_depth);
             });
             (Some(handle), Some(tx))
         } else {
@@ -176,6 +180,7 @@ impl BufferManager {
             io,
             io_inflight_count,
             io_inflight_cv,
+            evict_cv,
             free_list: Mutex::new(Vec::new()),
             bg_write,
             bg_handle,
@@ -336,6 +341,12 @@ impl BufferManager {
 
     /// Evict up to `batch` pages using a clock-style second chance policy.
     pub fn evict(&self) {
+        // If inflight IO is saturated, park briefly to allow completions to drain.
+        if self.io_inflight_count.load(Ordering::Relaxed) >= self.config.io_depth * self.config.io_workers {
+            let (lock, cvar) = (&self.evict_cv.0, &self.evict_cv.1);
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(1));
+        }
         // Opportunistically reap finished BGWRITE completions to avoid buildup.
         if self.bg_write {
             self.poll_bg_completions();
@@ -389,6 +400,8 @@ impl BufferManager {
         // Phase 1: write dirty pages (still S-locked). If bg_write is enabled, enqueue and track inflight.
         if !to_write.is_empty() {
             if self.bg_write {
+                // If inflight is saturated, wait instead of immediate fallback.
+                self.wait_for_inflight_global();
                 for &pid in &to_write {
                     let ps = self.page_state_ref(pid);
                     let mut buf = unsafe {
@@ -548,6 +561,9 @@ fn spin() {
         if v & 0x3FF == 0 {
             // Occasionally sleep a little to reduce contention under heavy spin.
             std::thread::sleep(std::time::Duration::from_nanos(50));
+        } else if v & 0x7FFF == 0 {
+            // Periodically park for a short duration to avoid livelock under long waits.
+            std::thread::park_timeout(std::time::Duration::from_micros(10));
         } else if v & 0x7F == 0 {
             std::thread::yield_now();
         } else {
@@ -589,11 +605,15 @@ pub struct BgStatsSnapshot {
     pub saturated: u64,
     pub fallback_sync: u64,
     pub errors: u64,
+    pub errors_enospc: u64,
+    pub errors_eio: u64,
     pub batches: u64,
     pub max_batch: u64,
     pub inflight: u64,
     pub queue_len: u64,
     pub retries: u64,
+    pub wait_park: u64,
+    pub io_queues: Option<crate::io::IoStatsSnapshot>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -674,6 +694,9 @@ pub struct BgStats {
     pub batches: AtomicU64,
     pub max_batch: AtomicU64,
     pub retries: AtomicU64,
+    pub errors_enospc: AtomicU64,
+    pub errors_eio: AtomicU64,
+    pub wait_park: AtomicU64,
 }
 
 impl BufferManager {
@@ -684,6 +707,7 @@ impl BufferManager {
         stats: Arc<BgStats>,
         inflight_count: Arc<AtomicU64>,
         inflight_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
+        evict_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
         inflight_limit: u64,
     ) {
         let mut batch = Vec::with_capacity(64);
@@ -734,10 +758,14 @@ impl BufferManager {
                 if let Some(rx) = io.write_pages_async(bufs) {
                     let needed = batch_len as u64;
                     // park/backoff until inflight allows submission; if unable after several attempts, fallback.
-                    if Self::wait_for_inflight(&inflight_count, &inflight_cv, inflight_limit, needed) {
+                    if Self::wait_for_inflight(&inflight_count, &inflight_cv, inflight_limit, needed, &stats) {
                         inflight_count.fetch_add(needed, Ordering::SeqCst);
                         let res = rx.recv().unwrap_or_else(|_| Err("async channel closed".into()));
-                        let mut had_err = res.is_err();
+                        let _had_err = res.is_err();
+                        inflight_count.fetch_sub(needed, Ordering::SeqCst);
+                        inflight_count.fetch_add(needed, Ordering::SeqCst);
+                        let res = rx.recv().unwrap_or_else(|_| Err("async channel closed".into()));
+                        let _had_err = res.is_err();
                         if let Err(_e) = &res {
                             // retry once synchronously for hard errors
                             for req in &batch {
@@ -747,21 +775,18 @@ impl BufferManager {
                         }
                         for req in batch.drain(..) {
                             let mapped = res.as_ref().map(|_| ()).map_err(|e| e.to_string().into());
-                            if mapped.is_err() {
-                                had_err = true;
-                            }
                             let _ = req.done.send(mapped);
                         }
-                        if had_err {
+                        if res.is_err() {
                             stats.errors.fetch_add(1, Ordering::Relaxed);
                         } else {
                             stats.completed.fetch_add(batch_len as u64, Ordering::Relaxed);
                         }
                         stats.batches.fetch_add(1, Ordering::Relaxed);
                         stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
-                        inflight_count.fetch_sub(needed, Ordering::SeqCst);
                         // notify any waiters that inflight dropped
                         inflight_cv.1.notify_all();
+                        evict_cv.1.notify_all();
                         continue;
                     } else {
                         stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
@@ -886,17 +911,22 @@ impl BufferManager {
             return None;
         }
         let queued = self.bg_tx.as_ref().map(|tx| tx.len() as u64).unwrap_or(0);
+        let io_stats = self.io.queue_stats();
         Some(BgStatsSnapshot {
             enqueued: self.bg_stats.enqueued.load(Ordering::Relaxed),
             completed: self.bg_stats.completed.load(Ordering::Relaxed),
             saturated: self.bg_stats.saturated.load(Ordering::Relaxed),
             fallback_sync: self.bg_stats.fallback_sync.load(Ordering::Relaxed),
             errors: self.bg_stats.errors.load(Ordering::Relaxed),
+            errors_enospc: self.bg_stats.errors_enospc.load(Ordering::Relaxed),
+            errors_eio: self.bg_stats.errors_eio.load(Ordering::Relaxed),
             batches: self.bg_stats.batches.load(Ordering::Relaxed),
             max_batch: self.bg_stats.max_batch.load(Ordering::Relaxed),
             inflight: self.bg_inflight.lock().unwrap().len() as u64,
             queue_len: queued,
             retries: self.bg_stats.retries.load(Ordering::Relaxed),
+            wait_park: self.bg_stats.wait_park.load(Ordering::Relaxed),
+            io_queues: io_stats,
         })
     }
 
@@ -986,19 +1016,36 @@ impl BufferManager {
         cv: &Arc<(Mutex<()>, std::sync::Condvar)>,
         limit: u64,
         need: u64,
+        stats: &Arc<BgStats>,
     ) -> bool {
         let mut attempts = 0;
-        while attempts < 5 {
+        loop {
             let current = count.load(Ordering::SeqCst);
             if current + need <= limit {
                 return true;
             }
             attempts += 1;
+            stats.wait_park.fetch_add(1, Ordering::Relaxed);
             // Park on condvar to be woken when inflight drains or on timeout.
             let (lock, cvar) = (&cv.0, &cv.1);
             let guard = lock.lock().unwrap();
-            let _ = cvar.wait_timeout(guard, std::time::Duration::from_micros(50 * (1 << attempts)));
+            let wait_dur = std::time::Duration::from_micros((50 * (1 << attempts)).min(5_000));
+            let _ = cvar.wait_timeout(guard, wait_dur);
+            if attempts > 10 {
+                return false; // give up after extended wait
+            }
         }
-        false
+    }
+
+    /// Block eviction thread when inflight IO is saturated; wake via evict_cv.
+    fn wait_for_inflight_global(&self) {
+        let limit = self.config.io_depth * self.config.io_workers;
+        let current = self.io_inflight_count.load(Ordering::SeqCst);
+        if current < limit {
+            return;
+        }
+        let (lock, cvar) = (&self.evict_cv.0, &self.evict_cv.1);
+        let guard = lock.lock().unwrap();
+        let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(1));
     }
 }

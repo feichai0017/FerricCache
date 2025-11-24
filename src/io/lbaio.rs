@@ -81,6 +81,7 @@ mod lbaio_impl {
         _max_ios: usize,
         async_tx: Vec<Sender<AsyncReq>>,
         affinity: Option<Vec<usize>>,
+        queue_stats: Vec<IoQueueCounters>,
     }
 
     unsafe impl Send for LibaioIo {}
@@ -97,7 +98,11 @@ mod lbaio_impl {
             let mut ctx: AioContext = 0;
             io_setup(max_ios, &mut ctx)?;
             let mut senders = Vec::with_capacity(workers.max(1));
-            let io = Arc::new(Self { file, ctx, _max_ios: max_ios, async_tx: Vec::new(), affinity: affinity.clone() });
+            let mut queue_stats = Vec::with_capacity(workers.max(1));
+            for _ in 0..workers.max(1) {
+                queue_stats.push(IoQueueCounters::default());
+            }
+            let io = Arc::new(Self { file, ctx, _max_ios: max_ios, async_tx: Vec::new(), affinity: affinity.clone(), queue_stats });
             for i in 0..workers.max(1) {
                 let (tx, rx) = crossbeam_channel::bounded::<AsyncReq>(max_ios.max(1));
                 senders.push(tx);
@@ -171,6 +176,7 @@ mod lbaio_impl {
                             let _ = self.write_page(*pid, ptr);
                         }
                         let _ = req.done.send(Err(e));
+                        self.queue_stats[req.queue_idx].fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Err("io_submit failed".into());
                     }
                 }
@@ -205,6 +211,7 @@ mod lbaio_impl {
                     let _ = self.write_page(pid, ptr);
                 }
                 let _ = req.done.send(Err("io_getevents timeout".into()));
+                self.queue_stats[req.queue_idx].timeout.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err("io_getevents timeout".into());
             }
             let mut ok = true;
@@ -224,14 +231,24 @@ mod lbaio_impl {
                     let _ = self.write_page(pid, ptr);
                 }
                 let _ = req.done.send(Err("async write error".into()));
+                self.queue_stats[req.queue_idx].retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err("async write error".into())
             }
         }
     }
 
     struct AsyncReq {
+        queue_idx: usize,
         bufs: Vec<(u64, Vec<u8>)>,
         done: std::sync::mpsc::Sender<Result<()>>,
+    }
+
+    #[derive(Default)]
+    struct IoQueueCounters {
+        submit: std::sync::atomic::AtomicU64,
+        fail: std::sync::atomic::AtomicU64,
+        timeout: std::sync::atomic::AtomicU64,
+        retries: std::sync::atomic::AtomicU64,
     }
 
     impl crate::io::PageIo for LibaioIo {
@@ -371,15 +388,32 @@ mod lbaio_impl {
             bufs: Vec<(u64, Vec<u8>)>,
         ) -> Option<std::sync::mpsc::Receiver<Result<()>>> {
             let (tx, rx) = std::sync::mpsc::channel();
-            let req = AsyncReq { bufs, done: tx };
             if self.async_tx.is_empty() {
                 return None;
             }
             let idx = (get_worker_id() as usize) % self.async_tx.len();
+            let req = AsyncReq { queue_idx: idx, bufs, done: tx };
+            self.queue_stats[idx].submit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.async_tx[idx].try_send(req) {
                 Ok(_) => Some(rx),
-                Err(_) => None,
+                Err(_) => {
+                    self.queue_stats[idx].fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
             }
+        }
+
+        fn queue_stats(&self) -> Option<crate::io::IoStatsSnapshot> {
+            let mut queues = Vec::with_capacity(self.queue_stats.len());
+            for q in &self.queue_stats {
+                queues.push(crate::io::IoQueueSnapshot {
+                    submit: q.submit.load(std::sync::atomic::Ordering::Relaxed),
+                    fail: q.fail.load(std::sync::atomic::Ordering::Relaxed),
+                    timeout: q.timeout.load(std::sync::atomic::Ordering::Relaxed),
+                    retries: q.retries.load(std::sync::atomic::Ordering::Relaxed),
+                });
+            }
+            Some(crate::io::IoStatsSnapshot { queues })
         }
     }
 }

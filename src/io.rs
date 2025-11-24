@@ -41,6 +41,24 @@ pub trait PageIo: Send + Sync {
     ) -> Option<std::sync::mpsc::Receiver<Result<()>>> {
         None
     }
+
+    /// Optional per-queue IO stats snapshot.
+    fn queue_stats(&self) -> Option<IoStatsSnapshot> {
+        None
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct IoQueueSnapshot {
+    pub submit: u64,
+    pub fail: u64,
+    pub timeout: u64,
+    pub retries: u64,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct IoStatsSnapshot {
+    pub queues: Vec<IoQueueSnapshot>,
 }
 
 /// Synchronous file-based IO implementation using pread/pwrite.

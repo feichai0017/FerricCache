@@ -128,6 +128,10 @@ impl PageState {
                 .compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                // If we just released the last shared lock, notify potential parkers.
+                if s == 1 {
+                    std::thread::yield_now();
+                }
                 return;
             }
         }

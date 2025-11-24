@@ -70,7 +70,7 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
                 let hit_rate = if total_reads == 0 { 0.0 } else { 1.0 - (total_faults as f64 / total_reads as f64) };
                 let bg = snap.bgwrite.unwrap_or_default();
                 println!(
-                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}",
+                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}, bg_wait_park={}, bg_retry={}",
                     total_reads,
                     total_faults,
                     hit_rate,
@@ -82,7 +82,17 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
                     bg.completed,
                     bg.enqueued,
                     bg.errors,
+                    bg.wait_park,
+                    bg.retries,
                 );
+                if let Some(ref ioq) = bg.io_queues {
+                    for (i, q) in ioq.queues.iter().enumerate() {
+                        println!(
+                            "[io_queue {}] submit={}, fail={}, timeout={}, retries={}",
+                            i, q.submit, q.fail, q.timeout, q.retries
+                        );
+                    }
+                }
                 csv.log(start.elapsed(), total_reads, total_faults, total_evicts, total_writes, &bg, &snap.exmap);
                 thread::sleep(Duration::from_secs(stats_intv));
             }
@@ -171,9 +181,17 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
     }
     if let Some(bg) = stats.bgwrite {
         println!(
-            "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}, batches={}, max_batch={}, queue={}, inflight={}",
-            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors, bg.batches, bg.max_batch, bg.queue_len, bg.inflight
+            "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}, errors_enospc={}, errors_eio={}, batches={}, max_batch={}, queue={}, inflight={}, wait_park={}, retries={}",
+            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors, bg.errors_enospc, bg.errors_eio, bg.batches, bg.max_batch, bg.queue_len, bg.inflight, bg.wait_park, bg.retries
         );
+        if let Some(ioq) = &bg.io_queues {
+            for (i, q) in ioq.queues.iter().enumerate() {
+                println!(
+                    "io_queue {}: submit={}, fail={}, timeout={}, retries={}",
+                    i, q.submit, q.fail, q.timeout, q.retries
+                );
+            }
+        }
     }
     println!(
         "exmap: requested={}, active={}, reason={:?}",
