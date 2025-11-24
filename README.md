@@ -37,6 +37,7 @@ A Rust reimplementation of [VMCache (SIGMOD’23 Virtual-Memory Assisted Buffer 
 - `btree`: VMCache-style node layout (prefix/fence/hints), optimistic/shared/exclusive guards, split/merge, root PID tracking.
 - `bench`: TPCC-lite and random-read; VMCache-compatible CSV + optional BGWRITE/IO queue stats; periodic stats thread.
 - `tests`: PageState invariants, eviction order/pressure, B+Tree CRUD/merge, BGWRITE config, worker_id stats.
+- Optional C ABI (enable feature `capi`): `ferric_init/destroy/alloc_page/fix_s/fix_x/unfix/mark_dirty/evict/poll_bg/stats` exported as `extern "C"` with POD config/stats structs mirroring VMCache knobs.
 
 ## How it works (pipeline sketch)
 1) **Fix/Fault**: `fix_s/fix_x` check `PageState`; if evicted, fault in (pread/exmap alloc), mark dirty on first write, stats per worker.

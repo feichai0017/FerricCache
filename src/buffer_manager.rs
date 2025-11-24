@@ -230,6 +230,13 @@ impl BufferManager {
         unsafe { self.virt_region.as_ptr().add(pid as usize) }
     }
 
+    /// mark dirty (caller ensures pid validity and pinning).
+    pub fn mark_dirty(&self, pid: u64) {
+        unsafe {
+            (*self.to_ptr(pid)).dirty = true;
+        }
+    }
+
     /// Attempt to map a page pointer back to PID.
     pub fn to_pid(&self, ptr: *const Page) -> Option<u64> {
         let base = self.virt_region.as_ptr() as usize;
