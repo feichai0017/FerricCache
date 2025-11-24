@@ -192,7 +192,7 @@ impl<'a, T> Drop for GuardS<'a, T> {
 #[inline]
 fn spin() {
     thread_local! {
-        static SPIN_COUNTER: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        static SPIN_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
     SPIN_COUNTER.with(|c| {
         let v = c.get().wrapping_add(1);

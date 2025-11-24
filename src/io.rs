@@ -16,6 +16,7 @@ pub trait PageIo: Send + Sync {
     fn write_page(&self, pid: u64, src: *const Page) -> Result<()>;
 
     /// Optional batch write; default falls back to per-page writes.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn write_pages(&self, pids: &[u64], base: *const Page) -> Result<()> {
         for &pid in pids {
             let ptr = unsafe { base.add(pid as usize) };
@@ -72,6 +73,7 @@ impl SyncFileIo {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)?;
         Ok(Arc::new(Self { file }))
     }
@@ -81,6 +83,7 @@ impl SyncFileIo {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)?;
         file.set_len(len)?;
         Ok(Arc::new(Self { file }))

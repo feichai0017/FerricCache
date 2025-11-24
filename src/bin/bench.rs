@@ -417,7 +417,7 @@ fn run_tpcc(
                 set_worker_id(tid as u16);
                 barrier.wait();
                 let mut rng = StdRng::seed_from_u64(99 + tid);
-                let mix = WeightedIndex::new(&[45, 43, 4, 4, 4]).unwrap(); // new_order, payment, order_status, stock_level, delivery
+            let mix = WeightedIndex::new([45, 43, 4, 4, 4]).unwrap(); // new_order, payment, order_status, stock_level, delivery
                 let warehouses = cfg_cloned.data_size;
                 let cust_dist = Uniform::from(0..customers_per_dist);
                 let dist_dist = Uniform::from(0..districts_per_wh);
@@ -663,6 +663,7 @@ impl StatsCsv {
         Self { file: None }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log(
         &self,
         elapsed: Duration,

@@ -103,6 +103,7 @@ impl PageState {
     /// - UNLOCKED: increment to 1
     /// - existing shared count < MAX_SHARED: increment
     /// - MARKED: allow shared access, set to 1
+    ///
     /// Returns true on success.
     pub fn try_lock_s(&self, expected: u64) -> bool {
         let s = Self::state(expected);

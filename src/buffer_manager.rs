@@ -495,31 +495,29 @@ impl BufferManager {
                         self.try_mark_if_unlocked(pid);
                     }
                 }
-            } else {
-                if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
-                    // fallback per-page
-                    Self::classify_io_error(&self.bg_stats, e.as_ref());
-                    for &pid in &to_write {
-                        if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
-                            Self::classify_io_error(&self.bg_stats, e2.as_ref());
-                            self.page_state_ref(pid).unlock_s();
-                        } else {
-                            unsafe {
-                                (*self.to_ptr(pid)).dirty = false;
-                            }
-                            self.write_count.fetch_add(1, Ordering::SeqCst);
-                            self.stats_inc_write();
-                        }
-                    }
-                } else {
-                    // clear dirty flags on success
-                    for &pid in &to_write {
+            } else if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
+                // fallback per-page
+                Self::classify_io_error(&self.bg_stats, e.as_ref());
+                for &pid in &to_write {
+                    if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
+                        Self::classify_io_error(&self.bg_stats, e2.as_ref());
+                        self.page_state_ref(pid).unlock_s();
+                    } else {
                         unsafe {
                             (*self.to_ptr(pid)).dirty = false;
                         }
                         self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
                     }
+                }
+            } else {
+                // clear dirty flags on success
+                for &pid in &to_write {
+                    unsafe {
+                        (*self.to_ptr(pid)).dirty = false;
+                    }
+                    self.write_count.fetch_add(1, Ordering::SeqCst);
+                    self.stats_inc_write();
                 }
             }
         }
@@ -612,7 +610,7 @@ const GB: u64 = 1024 * 1024 * 1024;
 #[inline]
 fn spin() {
     thread_local! {
-        static SPIN_COUNTER: Cell<u32> = Cell::new(0);
+        static SPIN_COUNTER: Cell<u32> = const { Cell::new(0) };
     }
     SPIN_COUNTER.with(|c| {
         let v = c.get().wrapping_add(1);
@@ -692,10 +690,10 @@ impl PerWorkerStats {
     }
 
     fn inc(
-        reads: &Vec<AtomicU64>,
-        writes: &Vec<AtomicU64>,
-        faults: &Vec<AtomicU64>,
-        evicts: &Vec<AtomicU64>,
+        reads: &[AtomicU64],
+        writes: &[AtomicU64],
+        faults: &[AtomicU64],
+        evicts: &[AtomicU64],
         idx: usize,
         kind: StatKind,
     ) {
@@ -773,7 +771,7 @@ impl BufferManager {
             let queue_full = self
                 .bg_tx
                 .as_ref()
-                .map(|tx| tx.len() as u64 >= (self.batch as u64 * 2))
+                .map(|tx| tx.len() as u64 >= (self.batch * 2))
                 .unwrap_or(false);
             if inflight < limit && !queue_full {
                 return;

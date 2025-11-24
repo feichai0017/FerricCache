@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use crate::buffer_manager::{BgStatsSnapshot, BufferManager, StatsSnapshot};
 use crate::config::Config;
 use crate::thread_local::set_worker_id;
@@ -49,19 +51,22 @@ impl Default for FerricConfig {
 
 impl From<&FerricConfig> for Config {
     fn from(c: &FerricConfig) -> Self {
-        let mut cfg = Config::default();
-        cfg.virt_gb = c.virt_gb;
-        cfg.phys_gb = c.phys_gb;
-        cfg.use_exmap = c.use_exmap != 0;
-        cfg.batch = c.batch;
-        cfg.run_for = c.run_for;
-        cfg.threads = c.threads;
-        cfg.data_size = c.data_size;
-        cfg.random_read = c.random_read != 0;
-        cfg.bg_write = c.bg_write != 0;
-        cfg.bg_write_threads = c.bg_write_threads;
-        cfg.io_depth = c.io_depth;
-        cfg.io_workers = c.io_workers;
+        let mut cfg = Config {
+            block_path: Config::default().block_path,
+            virt_gb: c.virt_gb,
+            phys_gb: c.phys_gb,
+            use_exmap: c.use_exmap != 0,
+            batch: c.batch,
+            run_for: c.run_for,
+            threads: c.threads,
+            data_size: c.data_size,
+            random_read: c.random_read != 0,
+            bg_write: c.bg_write != 0,
+            bg_write_threads: c.bg_write_threads,
+            io_depth: c.io_depth,
+            io_workers: c.io_workers,
+            io_affinity: None,
+        };
         // best-effort parse block path/affinity from C strings if provided
         if !c.block_path.is_null() {
             if let Ok(s) = unsafe { CStr::from_ptr(c.block_path) }.to_str() {
@@ -149,7 +154,7 @@ fn with_handle<T>(handle: *mut FerricHandle, f: impl FnOnce(&FerricHandle) -> T)
     Some(f(h))
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_init")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_init(cfg: *const FerricConfig) -> *mut FerricHandle {
     let fc = unsafe { cfg.as_ref() }
         .copied()
@@ -161,7 +166,7 @@ pub unsafe extern "C" fn ferric_init(cfg: *const FerricConfig) -> *mut FerricHan
     }
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_destroy")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_destroy(handle: *mut FerricHandle) {
     if handle.is_null() {
         return;
@@ -171,64 +176,67 @@ pub unsafe extern "C" fn ferric_destroy(handle: *mut FerricHandle) {
     }
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_set_worker_id")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_set_worker_id(id: u16) {
     set_worker_id(id);
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_alloc_page")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_alloc_page(handle: *mut FerricHandle) -> u64 {
     with_handle(handle, |h| h.bm.alloc_page().unwrap_or(0)).unwrap_or(0)
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_fix_s")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_fix_s(handle: *mut FerricHandle, pid: u64) -> *mut u8 {
     with_handle(handle, |h| h.bm.fix_s(pid) as *mut u8).unwrap_or(std::ptr::null_mut())
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_fix_x")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_fix_x(handle: *mut FerricHandle, pid: u64) -> *mut u8 {
     with_handle(handle, |h| h.bm.fix_x(pid) as *mut u8).unwrap_or(std::ptr::null_mut())
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_unfix_s")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_unfix_s(handle: *mut FerricHandle, pid: u64) {
-    if let Some(_) = with_handle(handle, |h| h.bm.unfix_s(pid)) {}
+    if with_handle(handle, |h| h.bm.unfix_s(pid)).is_some() {}
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_unfix_x")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_unfix_x(handle: *mut FerricHandle, pid: u64) {
-    if let Some(_) = with_handle(handle, |h| h.bm.unfix_x(pid)) {}
+    if with_handle(handle, |h| h.bm.unfix_x(pid)).is_some() {}
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_mark_dirty")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_mark_dirty(handle: *mut FerricHandle, pid: u64) {
-    if let Some(_) = with_handle(handle, |h| h.bm.mark_dirty(pid)) {}
+    if with_handle(handle, |h| h.bm.mark_dirty(pid)).is_some() {}
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_evict")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_evict(handle: *mut FerricHandle) {
-    if let Some(_) = with_handle(handle, |h| h.bm.evict()) {}
+    if with_handle(handle, |h| h.bm.evict()).is_some() {}
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_poll_bg")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_poll_bg(handle: *mut FerricHandle) {
-    if let Some(_) = with_handle(handle, |h| h.bm.poll_bg_completions()) {}
+    if with_handle(handle, |h| h.bm.poll_bg_completions()).is_some() {}
 }
 
-#[cfg_attr(feature = "capi", export_name = "ferric_stats")]
+#[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn ferric_stats(handle: *mut FerricHandle, out: *mut FerricStats) -> i32 {
     if out.is_null() {
         return -1;
     }
-    if let Some(_) = with_handle(handle, |h| {
+    if with_handle(handle, |h| {
         let snap = h.bm.stats_snapshot();
         let mut s = FerricStats::default();
         fill_stats(&snap, &mut s);
         unsafe {
             *out = s;
         }
-    }) {
+        Some(())
+    })
+    .is_some()
+    {
         0
     } else {
         -1

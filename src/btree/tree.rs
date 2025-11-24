@@ -146,13 +146,12 @@ impl BTree {
     }
 
     pub fn lookup<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> bool {
-        let found = loop {
+        loop {
             match self.lookup_inner(key, &mut f) {
-                Ok(found) => break found,
+                Ok(found) => return found,
                 Err(_) => continue, // restart
             }
-        };
-        found
+        }
     }
 
     fn lookup_inner<F: FnMut(&[u8])>(&self, key: &[u8], f: &mut F) -> Result<bool> {
@@ -178,12 +177,7 @@ impl BTree {
 
     /// Insert or replace by key (duplicates overwrite).
     pub fn insert(&self, key: &[u8], payload: &[u8]) -> Result<()> {
-        loop {
-            match self.insert_inner(key, payload) {
-                Ok(_) => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
+        self.insert_inner(key, payload)
     }
 
     /// Delete a key from the tree. Returns true if removed.
@@ -399,7 +393,7 @@ impl BTree {
         sep_key: Vec<u8>,
         right_pid: u64,
     ) -> Result<()> {
-        while let Some((parent_o, pos)) = path.pop() {
+        if let Some((parent_o, pos)) = path.pop() {
             let mut parent_x = GuardX::new_from_optimistic(parent_o)?;
             // Duplicate separator: replace existing mapping to point to new right child.
             if pos > 0 {

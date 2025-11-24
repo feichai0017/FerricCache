@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 thread_local! {
-    static WORKER_ID: Cell<u16> = Cell::new(0);
+    static WORKER_ID: Cell<u16> = const { Cell::new(0) };
 }
 
 pub fn set_worker_id(id: u16) {

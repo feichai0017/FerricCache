@@ -50,13 +50,12 @@ impl ResidentPageSet {
         loop {
             let curr = self.entries[pos as usize].load(Ordering::Acquire);
             assert!(curr != pid, "duplicate insert of pid {}", pid);
-            if curr == Self::EMPTY || curr == Self::TOMBSTONE {
-                if self.entries[pos as usize]
+            if (curr == Self::EMPTY || curr == Self::TOMBSTONE)
+                && self.entries[pos as usize]
                     .compare_exchange(curr, pid, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-                {
-                    return;
-                }
+            {
+                return;
             }
             pos = (pos + 1) & self.mask;
         }
