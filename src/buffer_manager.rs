@@ -1,26 +1,24 @@
-use crate::config::Config;
-use crate::memory::{
-    page::Page,
-    page_state::{state, PageState},
-    ResidentPageSet,
-    VirtualRegion,
-    create_region,
-    RegionKind,
-    PAGE_SIZE,
-};
 use crate::Result;
+use crate::Result as FerricResult;
+use crate::config::Config;
 use crate::io::PageIo;
 #[cfg(not(feature = "libaio"))]
 use crate::io::SyncFileIo;
 #[cfg(feature = "libaio")]
 use crate::io::lbaio::LibaioIo;
-use crate::Result as FerricResult;
+use crate::memory::{
+    PAGE_SIZE, RegionKind, ResidentPageSet, VirtualRegion, create_region,
+    page::Page,
+    page_state::{PageState, state},
+};
 use crate::thread_local::{get_worker_id, set_worker_id};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TrySendError};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{Sender, Receiver, TryRecvError};
 use std::cell::Cell;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Core buffer manager responsible for page lifecycle.
 ///
@@ -112,16 +110,23 @@ impl BufferManager {
                 .create(true)
                 .open(&config.block_path)?;
             file.set_len(virt_size)?;
-            let affinity = config
-                .io_affinity
-                .as_ref()
-                .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect::<Vec<_>>());
-            LibaioIo::open(file, config.io_depth as usize, config.io_workers as usize, affinity)?
+            let affinity = config.io_affinity.as_ref().map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            });
+            LibaioIo::open(
+                file,
+                config.io_depth as usize,
+                config.io_workers as usize,
+                affinity,
+            )?
         };
         #[cfg(not(feature = "libaio"))]
         let io: Arc<dyn PageIo> = SyncFileIo::open_with_len(&config.block_path, virt_size)?;
 
-        let page_count = usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?;
+        let page_count =
+            usize::try_from(virt_count).map_err(|_| "virt_count does not fit in usize")?;
         let (virt_region, region_kind, exmap_reason) = create_region(page_count, config.use_exmap)?;
         if config.use_exmap && region_kind != RegionKind::Exmap {
             if let Some(msg) = &exmap_reason {
@@ -150,10 +155,22 @@ impl BufferManager {
             let evict_cv_clone = evict_cv.clone();
             // Dedicated IO context for background writes (libaio if enabled, else sync).
             let bg_io = Self::make_io_for_bg(&config, virt_size)?;
-            let bg_worker_id = if config.threads > 0 { config.threads as u16 } else { 0 };
+            let bg_worker_id = if config.threads > 0 {
+                config.threads as u16
+            } else {
+                0
+            };
             let handle = std::thread::spawn(move || {
                 set_worker_id(bg_worker_id);
-                Self::bg_worker(rx, bg_io, stats_clone, inflight_clone, inflight_cv_clone, evict_cv_clone, config.io_depth);
+                Self::bg_worker(
+                    rx,
+                    bg_io,
+                    stats_clone,
+                    inflight_clone,
+                    inflight_cv_clone,
+                    evict_cv_clone,
+                    config.io_depth,
+                );
             });
             (Some(handle), Some(tx))
         } else {
@@ -193,7 +210,12 @@ impl BufferManager {
     }
 
     #[cfg(test)]
-    pub fn new_with_pages(block_path: String, virt_pages: u64, phys_pages: u64, batch: u64) -> Result<Self> {
+    pub fn new_with_pages(
+        block_path: String,
+        virt_pages: u64,
+        phys_pages: u64,
+        batch: u64,
+    ) -> Result<Self> {
         let mut cfg = Config::default();
         cfg.block_path = block_path;
         cfg.batch = batch;
@@ -269,23 +291,33 @@ impl BufferManager {
     /// Fix a page in exclusive (write) mode, handling faults.
     pub fn fix_x(&self, pid: u64) -> *mut Page {
         let ps = self.page_state_ref(pid);
+        let mut spins: u32 = 0;
         loop {
             let v = ps.load();
             match PageState::state(v) {
                 crate::memory::page_state::state::EVICTED => {
                     if ps.try_lock_x(v) {
                         self.handle_fault(pid);
-                        unsafe { (*self.to_ptr(pid)).dirty = true; }
+                        unsafe {
+                            (*self.to_ptr(pid)).dirty = true;
+                        }
                         return self.to_ptr(pid);
                     }
                 }
-                crate::memory::page_state::state::MARKED | crate::memory::page_state::state::UNLOCKED => {
+                crate::memory::page_state::state::MARKED
+                | crate::memory::page_state::state::UNLOCKED => {
                     if ps.try_lock_x(v) {
-                        unsafe { (*self.to_ptr(pid)).dirty = true; }
+                        unsafe {
+                            (*self.to_ptr(pid)).dirty = true;
+                        }
                         return self.to_ptr(pid);
                     }
                 }
                 _ => {}
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3FF == 0 {
+                ps.wait_for_unlock(Duration::from_micros(50));
             }
             spin();
         }
@@ -294,6 +326,7 @@ impl BufferManager {
     /// Fix a page in shared (read) mode, handling faults.
     pub fn fix_s(&self, pid: u64) -> *mut Page {
         let ps = self.page_state_ref(pid);
+        let mut spins: u32 = 0;
         loop {
             let v = ps.load();
             match PageState::state(v) {
@@ -310,6 +343,10 @@ impl BufferManager {
                         return self.to_ptr(pid);
                     }
                 }
+            }
+            spins = spins.wrapping_add(1);
+            if spins & 0x3FF == 0 {
+                ps.wait_for_unlock(Duration::from_micros(50));
             }
             spin();
         }
@@ -335,17 +372,16 @@ impl BufferManager {
 
     fn read_page(&self, pid: u64) -> Result<()> {
         self.io.read_page(pid, self.to_ptr(pid))?;
-        unsafe { (*self.to_ptr(pid)).dirty = false; }
+        unsafe {
+            (*self.to_ptr(pid)).dirty = false;
+        }
         Ok(())
     }
 
     /// Evict up to `batch` pages using a clock-style second chance policy.
     pub fn evict(&self) {
-        // If inflight IO is saturated, park briefly to allow completions to drain.
-        if self.io_inflight_count.load(Ordering::Relaxed) >= self.config.io_depth * self.config.io_workers {
-            let (lock, cvar) = (&self.evict_cv.0, &self.evict_cv.1);
-            let guard = lock.lock().unwrap();
-            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(1));
+        if self.bg_write {
+            self.wait_for_bg_capacity();
         }
         // Opportunistically reap finished BGWRITE completions to avoid buildup.
         if self.bg_write {
@@ -401,18 +437,23 @@ impl BufferManager {
         if !to_write.is_empty() {
             if self.bg_write {
                 // If inflight is saturated, wait instead of immediate fallback.
-                self.wait_for_inflight_global();
+                self.wait_for_bg_capacity();
                 for &pid in &to_write {
+                    self.wait_for_bg_capacity();
                     let ps = self.page_state_ref(pid);
                     let mut buf = unsafe {
-                        std::slice::from_raw_parts(self.to_ptr(pid) as *const u8, PAGE_SIZE).to_vec()
+                        std::slice::from_raw_parts(self.to_ptr(pid) as *const u8, PAGE_SIZE)
+                            .to_vec()
                     };
                     if let Some(tx) = &self.bg_tx {
                         let (done_tx, done_rx) = std::sync::mpsc::channel();
                         // try to enqueue; if full or closed, fall back to sync write
-                        let mut attempts = 0;
                         loop {
-                            match tx.try_send(BgRequest { pid, buf, done: done_tx.clone() }) {
+                            match tx.try_send(BgRequest {
+                                pid,
+                                buf,
+                                done: done_tx.clone(),
+                            }) {
                                 Ok(_) => {
                                     self.bg_stats.enqueued.fetch_add(1, Ordering::Relaxed);
                                     self.bg_inflight.lock().unwrap().insert(pid, done_rx);
@@ -420,13 +461,8 @@ impl BufferManager {
                                 }
                                 Err(TrySendError::Full(err_req)) => {
                                     self.bg_stats.saturated.fetch_add(1, Ordering::Relaxed);
-                                    // recover buffer ownership for retry
                                     buf = err_req.buf;
-                                    attempts += 1;
-                                    if attempts >= 3 {
-                                        break;
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_micros(50));
+                                    self.wait_for_bg_capacity();
                                     continue;
                                 }
                                 Err(TrySendError::Disconnected(_)) => break,
@@ -437,11 +473,14 @@ impl BufferManager {
                         }
                     }
                     // fallback sync if send fails
-                    if let Err(_e) = self.io.write_page(pid, self.to_ptr(pid)) {
+                    if let Err(e) = self.io.write_page(pid, self.to_ptr(pid)) {
+                        Self::classify_io_error(&self.bg_stats, e.as_ref());
                         ps.unlock_s();
                     } else {
                         self.bg_stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
-                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        unsafe {
+                            (*self.to_ptr(pid)).dirty = false;
+                        }
                         self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
                         // release the eviction-held shared lock immediately on sync fallback
@@ -450,13 +489,17 @@ impl BufferManager {
                     }
                 }
             } else {
-                if let Err(_e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
+                if let Err(e) = self.io.write_pages(&to_write, self.to_ptr(0)) {
                     // fallback per-page
+                    Self::classify_io_error(&self.bg_stats, e.as_ref());
                     for &pid in &to_write {
-                        if let Err(_e2) = self.io.write_page(pid, self.to_ptr(pid)) {
+                        if let Err(e2) = self.io.write_page(pid, self.to_ptr(pid)) {
+                            Self::classify_io_error(&self.bg_stats, e2.as_ref());
                             self.page_state_ref(pid).unlock_s();
                         } else {
-                            unsafe { (*self.to_ptr(pid)).dirty = false; }
+                            unsafe {
+                                (*self.to_ptr(pid)).dirty = false;
+                            }
                             self.write_count.fetch_add(1, Ordering::SeqCst);
                             self.stats_inc_write();
                         }
@@ -464,7 +507,9 @@ impl BufferManager {
                 } else {
                     // clear dirty flags on success
                     for &pid in &to_write {
-                        unsafe { (*self.to_ptr(pid)).dirty = false; }
+                        unsafe {
+                            (*self.to_ptr(pid)).dirty = false;
+                        }
                         self.write_count.fetch_add(1, Ordering::SeqCst);
                         self.stats_inc_write();
                     }
@@ -488,7 +533,11 @@ impl BufferManager {
                 self.phys_used_count.fetch_sub(1, Ordering::SeqCst);
                 self.stats_inc_evict();
                 unsafe {
-                    libc::madvise(self.to_ptr(pid) as *mut libc::c_void, PAGE_SIZE, libc::MADV_DONTNEED);
+                    libc::madvise(
+                        self.to_ptr(pid) as *mut libc::c_void,
+                        PAGE_SIZE,
+                        libc::MADV_DONTNEED,
+                    );
                 }
             }
             return;
@@ -520,7 +569,11 @@ impl BufferManager {
             self.phys_used_count.fetch_sub(1, Ordering::SeqCst);
             self.stats_inc_evict();
             unsafe {
-                libc::madvise(self.to_ptr(pid) as *mut libc::c_void, PAGE_SIZE, libc::MADV_DONTNEED);
+                libc::madvise(
+                    self.to_ptr(pid) as *mut libc::c_void,
+                    PAGE_SIZE,
+                    libc::MADV_DONTNEED,
+                );
             }
         }
     }
@@ -545,7 +598,6 @@ impl BufferManager {
         set_worker_id(normalized);
         normalized
     }
-
 }
 
 const GB: u64 = 1024 * 1024 * 1024;
@@ -561,9 +613,6 @@ fn spin() {
         if v & 0x3FF == 0 {
             // Occasionally sleep a little to reduce contention under heavy spin.
             std::thread::sleep(std::time::Duration::from_nanos(50));
-        } else if v & 0x7FFF == 0 {
-            // Periodically park for a short duration to avoid livelock under long waits.
-            std::thread::park_timeout(std::time::Duration::from_micros(10));
         } else if v & 0x7F == 0 {
             std::thread::yield_now();
         } else {
@@ -625,9 +674,8 @@ pub struct ExmapSnapshot {
 
 impl PerWorkerStats {
     fn new(workers: usize) -> Self {
-        let make_vec = |size: usize| -> Vec<AtomicU64> {
-            (0..size).map(|_| AtomicU64::new(0)).collect()
-        };
+        let make_vec =
+            |size: usize| -> Vec<AtomicU64> { (0..size).map(|_| AtomicU64::new(0)).collect() };
         Self {
             reads: make_vec(workers),
             writes: make_vec(workers),
@@ -636,7 +684,14 @@ impl PerWorkerStats {
         }
     }
 
-    fn inc(reads: &Vec<AtomicU64>, writes: &Vec<AtomicU64>, faults: &Vec<AtomicU64>, evicts: &Vec<AtomicU64>, idx: usize, kind: StatKind) {
+    fn inc(
+        reads: &Vec<AtomicU64>,
+        writes: &Vec<AtomicU64>,
+        faults: &Vec<AtomicU64>,
+        evicts: &Vec<AtomicU64>,
+        idx: usize,
+        kind: StatKind,
+    ) {
         if idx >= reads.len() {
             return;
         }
@@ -700,6 +755,45 @@ pub struct BgStats {
 }
 
 impl BufferManager {
+    /// Eviction-side coordination: if inflight IO or BG queue is saturated, park until space frees.
+    fn wait_for_bg_capacity(&self) {
+        if !self.bg_write {
+            return;
+        }
+        let limit = self.config.io_depth * self.config.io_workers;
+        loop {
+            let inflight = self.io_inflight_count.load(Ordering::SeqCst);
+            let queue_full = self
+                .bg_tx
+                .as_ref()
+                .map(|tx| tx.len() as u64 >= (self.batch as u64 * 2))
+                .unwrap_or(false);
+            if inflight < limit && !queue_full {
+                return;
+            }
+            self.bg_stats.wait_park.fetch_add(1, Ordering::Relaxed);
+            let (lock, cvar) = (&self.evict_cv.0, &self.evict_cv.1);
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn classify_io_error(stats: &Arc<BgStats>, err: &(dyn std::error::Error + 'static)) {
+        if let Some(ioe) = err.downcast_ref::<io::Error>() {
+            if let Some(code) = ioe.raw_os_error() {
+                match code {
+                    libc::ENOSPC => {
+                        stats.errors_enospc.fetch_add(1, Ordering::Relaxed);
+                    }
+                    libc::EIO => {
+                        stats.errors_eio.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Background writer thread: receives page copies and writes them out.
     fn bg_worker(
         rx: CbReceiver<BgRequest>,
@@ -734,6 +828,8 @@ impl BufferManager {
                 let res = io.write_buf(req.pid, &req.buf);
                 let _ = req.done.send(res);
                 stats.completed.fetch_add(1, Ordering::Relaxed);
+                evict_cv.1.notify_all();
+                inflight_cv.1.notify_all();
                 continue;
             }
 
@@ -757,40 +853,46 @@ impl BufferManager {
                 }
                 if let Some(rx) = io.write_pages_async(bufs) {
                     let needed = batch_len as u64;
-                    // park/backoff until inflight allows submission; if unable after several attempts, fallback.
-                    if Self::wait_for_inflight(&inflight_count, &inflight_cv, inflight_limit, needed, &stats) {
-                        inflight_count.fetch_add(needed, Ordering::SeqCst);
-                        let res = rx.recv().unwrap_or_else(|_| Err("async channel closed".into()));
-                        let _had_err = res.is_err();
-                        inflight_count.fetch_sub(needed, Ordering::SeqCst);
-                        inflight_count.fetch_add(needed, Ordering::SeqCst);
-                        let res = rx.recv().unwrap_or_else(|_| Err("async channel closed".into()));
-                        let _had_err = res.is_err();
-                        if let Err(_e) = &res {
-                            // retry once synchronously for hard errors
-                            for req in &batch {
-                                let _ = io.write_page(req.pid, req.buf.as_ptr() as *const Page);
-                            }
-                            stats.retries.fetch_add(1, Ordering::Relaxed);
+                    // Park until inflight budget is available instead of falling back to sync.
+                    Self::wait_for_inflight(
+                        &inflight_count,
+                        &inflight_cv,
+                        inflight_limit,
+                        needed,
+                        &stats,
+                    );
+                    inflight_count.fetch_add(needed, Ordering::SeqCst);
+                    let res = rx
+                        .recv()
+                        .unwrap_or_else(|_| Err("async channel closed".into()));
+                    inflight_count.fetch_sub(needed, Ordering::SeqCst);
+                    if let Err(e) = &res {
+                        // retry once synchronously for hard errors
+                        Self::classify_io_error(&stats, e.as_ref());
+                        for req in &batch {
+                            let _ = io.write_page(req.pid, req.buf.as_ptr() as *const Page);
                         }
-                        for req in batch.drain(..) {
-                            let mapped = res.as_ref().map(|_| ()).map_err(|e| e.to_string().into());
-                            let _ = req.done.send(mapped);
-                        }
-                        if res.is_err() {
-                            stats.errors.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            stats.completed.fetch_add(batch_len as u64, Ordering::Relaxed);
-                        }
-                        stats.batches.fetch_add(1, Ordering::Relaxed);
-                        stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
-                        // notify any waiters that inflight dropped
-                        inflight_cv.1.notify_all();
-                        evict_cv.1.notify_all();
-                        continue;
-                    } else {
-                        stats.fallback_sync.fetch_add(1, Ordering::Relaxed);
+                        stats.retries.fetch_add(1, Ordering::Relaxed);
                     }
+                    for req in batch.drain(..) {
+                        let mapped = res.as_ref().map(|_| ()).map_err(|e| e.to_string().into());
+                        let _ = req.done.send(mapped);
+                    }
+                    if res.is_err() {
+                        stats.errors.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats
+                            .completed
+                            .fetch_add(batch_len as u64, Ordering::Relaxed);
+                    }
+                    stats.batches.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .max_batch
+                        .fetch_max(batch_len as u64, Ordering::Relaxed);
+                    // notify any waiters that inflight dropped
+                    inflight_cv.1.notify_all();
+                    evict_cv.1.notify_all();
+                    continue;
                 }
 
                 // fallback sync batch
@@ -801,16 +903,20 @@ impl BufferManager {
                 let base_ptr = tmp.as_ptr() as *const Page;
                 let pid_list: Vec<u64> = (0..batch_len).map(|i| first_pid + i as u64).collect();
                 let res = io.write_pages(&pid_list, base_ptr);
-                if res.is_err() {
+                if let Err(e) = &res {
+                    Self::classify_io_error(&stats, e.as_ref());
                     // partial retry per-page on failure
                     stats.retries.fetch_add(1, Ordering::Relaxed);
                     for req in batch.drain(..) {
                         let per = io.write_page(req.pid, req.buf.as_ptr() as *const Page);
-                        let _ = req.done.send(per.as_ref().map(|_| ()).map_err(|e| e.to_string().into()));
-                        if per.is_ok() {
-                            stats.completed.fetch_add(1, Ordering::Relaxed);
-                        } else {
+                        let _ = req
+                            .done
+                            .send(per.as_ref().map(|_| ()).map_err(|e| e.to_string().into()));
+                        if let Err(err) = &per {
+                            Self::classify_io_error(&stats, err.as_ref());
                             stats.errors.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.completed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 } else {
@@ -824,6 +930,7 @@ impl BufferManager {
                 for req in &batch {
                     let res = io.write_buf(req.pid, &req.buf);
                     if let Err(e) = &res {
+                        Self::classify_io_error(&stats, e.as_ref());
                         if first_err.is_none() {
                             first_err = Some(Err(e.to_string().into()));
                         }
@@ -840,8 +947,11 @@ impl BufferManager {
                 }
             }
             stats.batches.fetch_add(1, Ordering::Relaxed);
-            stats.max_batch.fetch_max(batch_len as u64, Ordering::Relaxed);
-
+            stats
+                .max_batch
+                .fetch_max(batch_len as u64, Ordering::Relaxed);
+            inflight_cv.1.notify_all();
+            evict_cv.1.notify_all();
         }
     }
 
@@ -854,11 +964,17 @@ impl BufferManager {
                 .create(true)
                 .open(&config.block_path)?;
             file.set_len(virt_size)?;
-            let affinity = config
-                .io_affinity
-                .as_ref()
-                .map(|s| s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect::<Vec<_>>());
-            return LibaioIo::open(file, config.io_depth as usize, config.io_workers as usize, affinity);
+            let affinity = config.io_affinity.as_ref().map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            });
+            return LibaioIo::open(
+                file,
+                config.io_depth as usize,
+                config.io_workers as usize,
+                affinity,
+            );
         }
         #[cfg(not(feature = "libaio"))]
         {
@@ -878,25 +994,53 @@ impl BufferManager {
 
     pub(crate) fn stats_inc_read(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
-            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Read);
+            PerWorkerStats::inc(
+                &stats.reads,
+                &stats.writes,
+                &stats.faults,
+                &stats.evicts,
+                idx,
+                StatKind::Read,
+            );
         }
     }
 
     pub(crate) fn stats_inc_write(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
-            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Write);
+            PerWorkerStats::inc(
+                &stats.reads,
+                &stats.writes,
+                &stats.faults,
+                &stats.evicts,
+                idx,
+                StatKind::Write,
+            );
         }
     }
 
     pub(crate) fn stats_inc_fault(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
-            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Fault);
+            PerWorkerStats::inc(
+                &stats.reads,
+                &stats.writes,
+                &stats.faults,
+                &stats.evicts,
+                idx,
+                StatKind::Fault,
+            );
         }
     }
 
     pub(crate) fn stats_inc_evict(&self) {
         if let (Some(idx), Some(stats)) = (self.stat_index(), &self.worker_stats) {
-            PerWorkerStats::inc(&stats.reads, &stats.writes, &stats.faults, &stats.evicts, idx, StatKind::Evict);
+            PerWorkerStats::inc(
+                &stats.reads,
+                &stats.writes,
+                &stats.faults,
+                &stats.evicts,
+                idx,
+                StatKind::Evict,
+            );
         }
     }
 
@@ -978,17 +1122,23 @@ impl BufferManager {
         match res {
             Ok(()) => {
                 self.bg_stats.completed.fetch_add(1, Ordering::Relaxed);
-                unsafe { (*self.to_ptr(pid)).dirty = false; }
+                unsafe {
+                    (*self.to_ptr(pid)).dirty = false;
+                }
                 self.write_count.fetch_add(1, Ordering::SeqCst);
                 self.stats_inc_write();
             }
-            Err(_e) => {
+            Err(e) => {
+                Self::classify_io_error(&self.bg_stats, e.as_ref());
                 self.bg_stats.errors.fetch_add(1, Ordering::Relaxed);
                 let _ = self.io.write_page(pid, self.to_ptr(pid));
             }
         }
         self.release_bg_shared_lock(pid);
         self.try_mark_if_unlocked(pid);
+        // Wake eviction thread to pick up newly free inflight slots.
+        self.evict_cv.1.notify_all();
+        self.io_inflight_cv.1.notify_all();
     }
 
     /// Release the S-lock held by eviction for bgwrite, if still present.
@@ -1010,42 +1160,24 @@ impl BufferManager {
         }
     }
 
-    /// Park/backoff until inflight allows additional async submissions; returns false if limit persists.
+    /// Park/backoff until inflight allows additional async submissions.
     fn wait_for_inflight(
         count: &Arc<AtomicU64>,
         cv: &Arc<(Mutex<()>, std::sync::Condvar)>,
         limit: u64,
         need: u64,
         stats: &Arc<BgStats>,
-    ) -> bool {
-        let mut attempts = 0;
+    ) {
         loop {
             let current = count.load(Ordering::SeqCst);
             if current + need <= limit {
-                return true;
+                return;
             }
-            attempts += 1;
             stats.wait_park.fetch_add(1, Ordering::Relaxed);
             // Park on condvar to be woken when inflight drains or on timeout.
             let (lock, cvar) = (&cv.0, &cv.1);
             let guard = lock.lock().unwrap();
-            let wait_dur = std::time::Duration::from_micros((50 * (1 << attempts)).min(5_000));
-            let _ = cvar.wait_timeout(guard, wait_dur);
-            if attempts > 10 {
-                return false; // give up after extended wait
-            }
+            let _ = cvar.wait_timeout(guard, std::time::Duration::from_micros(200));
         }
-    }
-
-    /// Block eviction thread when inflight IO is saturated; wake via evict_cv.
-    fn wait_for_inflight_global(&self) {
-        let limit = self.config.io_depth * self.config.io_workers;
-        let current = self.io_inflight_count.load(Ordering::SeqCst);
-        if current < limit {
-            return;
-        }
-        let (lock, cvar) = (&self.evict_cv.0, &self.evict_cv.1);
-        let guard = lock.lock().unwrap();
-        let _ = cvar.wait_timeout(guard, std::time::Duration::from_millis(1));
     }
 }

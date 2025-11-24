@@ -1,11 +1,13 @@
 use crate::btree::tree::BTree;
 use crate::buffer_manager::BufferManager;
-use std::sync::Arc;
 use rand::{Rng, seq::SliceRandom};
+use std::sync::Arc;
 
 #[test]
 fn mixed_insert_delete_scan_stress() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_mixed".to_string(), 128, 64, 4).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_mixed".to_string(), 128, 64, 4).unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     let mut keys: Vec<u8> = (0u8..100).collect();
     let mut rng = rand::thread_rng();

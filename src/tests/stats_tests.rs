@@ -21,7 +21,13 @@ fn stats_capture_eviction_activity() {
     if let Some(worker) = snap.worker {
         // All work ran on thread-local id 0 by default.
         assert!(!worker.is_empty());
-        assert!(worker[0].writes > 0, "per-worker write stats should record eviction writes");
-        assert!(worker[0].evicts > 0, "per-worker evict stats should record eviction count");
+        assert!(
+            worker[0].writes > 0,
+            "per-worker write stats should record eviction writes"
+        );
+        assert!(
+            worker[0].evicts > 0,
+            "per-worker evict stats should record eviction count"
+        );
     }
 }

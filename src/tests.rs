@@ -1,22 +1,22 @@
-use crate::memory::page_state::{state, PageState};
-use crate::memory::ResidentPageSet;
 use crate::buffer_manager::BufferManager;
 use crate::memory::PAGE_SIZE;
+use crate::memory::ResidentPageSet;
+use crate::memory::page_state::{PageState, state};
 use std::fs::OpenOptions;
 use std::io::Write;
 
-mod btree_tests;
-mod scan_tests;
-mod delete_tests;
-mod evict_tests;
 mod bgwrite_toggle;
+mod btree_tests;
+mod delete_tests;
 mod evict_phase_order;
 mod evict_stress_small;
-mod mixed_stress;
-mod worker_id;
-mod stats_tests;
-mod insert_regression;
+mod evict_tests;
 mod exmap_status;
+mod insert_regression;
+mod mixed_stress;
+mod scan_tests;
+mod stats_tests;
+mod worker_id;
 
 #[test]
 fn page_state_shared_and_mark_unlocks() {
@@ -55,14 +55,19 @@ fn resident_page_set_insert_remove() {
 fn alloc_write_evict_fault_cycle() {
     // Use a temp file-backed block device.
     let path = "/tmp/ferric_cache_test_block";
-    let mut f = OpenOptions::new().create(true).write(true).open(path).unwrap();
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     // Pre-size the file to a few pages.
     f.set_len((PAGE_SIZE * 8) as u64).unwrap();
     f.write_all(&vec![0u8; PAGE_SIZE * 8]).unwrap();
 
     let virt_pages = 8u64;
     let phys_pages = 4u64;
-    let bm = BufferManager::new_with_pages(path.to_string(), virt_pages, phys_pages, 1).expect("bm init");
+    let bm = BufferManager::new_with_pages(path.to_string(), virt_pages, phys_pages, 1)
+        .expect("bm init");
 
     let pid = bm.alloc_page().unwrap();
     let ptr = bm.fix_x(pid);
@@ -79,7 +84,10 @@ fn alloc_write_evict_fault_cycle() {
             break;
         }
     }
-    assert_eq!(PageState::state(bm.page_state_ref(pid).load()), state::EVICTED);
+    assert_eq!(
+        PageState::state(bm.page_state_ref(pid).load()),
+        state::EVICTED
+    );
 
     // Fault in via fix_s and verify data.
     let ptr2 = bm.fix_s(pid);

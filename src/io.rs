@@ -1,8 +1,8 @@
-use crate::memory::page::Page;
-use crate::memory::PAGE_SIZE;
 use crate::Result;
+use crate::memory::PAGE_SIZE;
+use crate::memory::page::Page;
+use std::fs::File;
 use std::fs::OpenOptions;
-use std::fs::{File};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;

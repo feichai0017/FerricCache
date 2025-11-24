@@ -4,12 +4,10 @@ use std::sync::Arc;
 
 #[test]
 fn inserts_preserve_all_keys() {
-    let bm = Arc::new(BufferManager::new_with_pages(
-        "/tmp/ferric_btree_insert_reg".to_string(),
-        256,
-        128,
-        4,
-    ).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_insert_reg".to_string(), 256, 128, 4)
+            .unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     for i in 0u64..200 {
         let key = i.to_le_bytes();
@@ -24,5 +22,9 @@ fn inserts_preserve_all_keys() {
             missing.push(i);
         }
     }
-    assert!(missing.is_empty(), "missing keys after insert: {:?}", missing);
+    assert!(
+        missing.is_empty(),
+        "missing keys after insert: {:?}",
+        missing
+    );
 }

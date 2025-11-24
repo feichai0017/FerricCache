@@ -1,33 +1,22 @@
-use ferric_cache::buffer_manager::BufferManager;
 use ferric_cache::btree::tree::BTree;
+use ferric_cache::buffer_manager::BufferManager;
 use ferric_cache::config::Config;
 use ferric_cache::memory::RegionKind;
 use ferric_cache::thread_local::set_worker_id;
+use rand::SeedableRng;
 use rand::distributions::{Distribution, Uniform, WeightedIndex};
 use rand::rngs::StdRng;
-use rand::SeedableRng;
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
-use std::thread;
-use std::sync::atomic::AtomicU64;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn main() -> ferric_cache::Result<()> {
     let mut cfg = Config::from_env();
-    // Only override datasize when env not provided; otherwise respect user value.
-    let datasize_env = env::var("DATASIZE").ok();
-    if datasize_env.is_none() && cfg.data_size == Config::default().data_size {
-        cfg.data_size = 10; // warehouses for TPCC by default
-    }
-    if env::var("VIRTGB").is_err() && cfg.virt_gb == Config::default().virt_gb {
-        cfg.virt_gb = 1;
-    }
-    if env::var("PHYSGB").is_err() && cfg.phys_gb == Config::default().phys_gb {
-        cfg.phys_gb = 1;
-    }
     if cfg.threads == 0 {
         cfg.threads = 1;
     }
@@ -35,7 +24,11 @@ fn main() -> ferric_cache::Result<()> {
     let bm = Arc::new(BufferManager::new(cfg.clone())?);
     let tree = BTree::new(bm.clone())?;
 
-    let exmap_tag = if bm.region_kind == RegionKind::Exmap { "exmap" } else { "mmap" };
+    let exmap_tag = if bm.region_kind == RegionKind::Exmap {
+        "exmap"
+    } else {
+        "mmap"
+    };
     if cfg.random_read {
         run_random_read(cfg, bm, tree, exmap_tag)?;
     } else {
@@ -44,47 +37,94 @@ fn main() -> ferric_cache::Result<()> {
     Ok(())
 }
 
-fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -> ferric_cache::Result<()> {
+fn run_random_read(
+    cfg: Config,
+    bm: Arc<BufferManager>,
+    tree: BTree,
+    exmap_tag: &str,
+) -> ferric_cache::Result<()> {
     println!(
         "random-read bench: keys={}, threads={}, run_for={}s, phys_gb={}, virt_gb={}, region={}, bgwrite={}",
         cfg.data_size, cfg.threads, cfg.run_for, cfg.phys_gb, cfg.virt_gb, exmap_tag, cfg.bg_write
     );
+    let system_tag = if exmap_tag == "exmap" {
+        "ferric-exmap".to_string()
+    } else {
+        "ferric".to_string()
+    };
 
     // Optional periodic stats printer (env STATS_INTERVAL_SECS).
     let stop = Arc::new(AtomicBool::new(false));
-    let stats_intv = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+    let stats_intv = env::var("STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1);
+    let ops_counter = Arc::new(AtomicU64::new(0));
     if stats_intv > 0 {
         let bm_stats = bm.clone();
         let stop_flag = stop.clone();
         let csv = StatsCsv::new();
         let start = Instant::now();
+        let ops = ops_counter.clone();
+        let threads = cfg.threads;
+        let data_size = cfg.data_size;
+        let batch = cfg.batch;
+        let system_tag = system_tag.clone();
+        let workload = "rndread".to_string();
         thread::spawn(move || {
+            let mut last_reads = 0u64;
+            let mut last_writes = 0u64;
+            let mut last_ops = 0u64;
+            let intv_dur = Duration::from_secs(stats_intv);
+            let intv_secs = stats_intv as f64;
+            println!("ts,tx,rmb,wmb,system,threads,datasize,workload,batch");
             while !stop_flag.load(Ordering::Relaxed) {
                 // reap bgwrite completions even when eviction not running
                 bm_stats.poll_bg_completions();
                 let snap = bm_stats.stats_snapshot();
-                let total_reads = snap.worker.as_ref().map(|w| w.iter().map(|s| s.reads).sum::<u64>()).unwrap_or(0);
-                let total_faults = snap.worker.as_ref().map(|w| w.iter().map(|s| s.faults).sum::<u64>()).unwrap_or(0);
-                let total_writes = snap.worker.as_ref().map(|w| w.iter().map(|s| s.writes).sum::<u64>()).unwrap_or(0);
-                let total_evicts = snap.worker.as_ref().map(|w| w.iter().map(|s| s.evicts).sum::<u64>()).unwrap_or(0);
-                let hit_rate = if total_reads == 0 { 0.0 } else { 1.0 - (total_faults as f64 / total_reads as f64) };
-                let bg = snap.bgwrite.unwrap_or_default();
+                let total_reads = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.reads).sum::<u64>())
+                    .unwrap_or(0);
+                let total_faults = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.faults).sum::<u64>())
+                    .unwrap_or(0);
+                let total_writes = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.writes).sum::<u64>())
+                    .unwrap_or(0);
+                let total_evicts = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.evicts).sum::<u64>())
+                    .unwrap_or(0);
+                let delta_reads = total_reads.saturating_sub(last_reads);
+                let delta_writes = total_writes.saturating_sub(last_writes);
+                let live_ops = ops.load(Ordering::Relaxed);
+                let delta_ops = live_ops.saturating_sub(last_ops);
+                let rmb = delta_reads as f64 * ferric_cache::memory::PAGE_SIZE as f64
+                    / 1_000_000.0
+                    / intv_secs;
+                let wmb = delta_writes as f64 * ferric_cache::memory::PAGE_SIZE as f64
+                    / 1_000_000.0
+                    / intv_secs;
                 println!(
-                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}, bg_wait_park={}, bg_retry={}",
-                    total_reads,
-                    total_faults,
-                    hit_rate,
-                    total_evicts,
-                    total_writes,
-                    snap.phys_used,
-                    bg.queue_len,
-                    bg.inflight,
-                    bg.completed,
-                    bg.enqueued,
-                    bg.errors,
-                    bg.wait_park,
-                    bg.retries,
+                    "{},{:.2},{:.4},{:.4},{},{},{},{},{}",
+                    start.elapsed().as_secs(),
+                    delta_ops as f64 / intv_secs,
+                    rmb,
+                    wmb,
+                    system_tag,
+                    threads,
+                    data_size,
+                    workload,
+                    batch
                 );
+                let bg = snap.bgwrite.unwrap_or_default();
                 if let Some(ref ioq) = bg.io_queues {
                     for (i, q) in ioq.queues.iter().enumerate() {
                         println!(
@@ -93,8 +133,19 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
                         );
                     }
                 }
-                csv.log(start.elapsed(), total_reads, total_faults, total_evicts, total_writes, &bg, &snap.exmap);
-                thread::sleep(Duration::from_secs(stats_intv));
+                csv.log(
+                    start.elapsed(),
+                    total_reads,
+                    total_faults,
+                    total_evicts,
+                    total_writes,
+                    &bg,
+                    &snap.exmap,
+                );
+                last_reads = total_reads;
+                last_writes = total_writes;
+                last_ops = live_ops;
+                thread::sleep(intv_dur);
             }
         });
     }
@@ -106,34 +157,38 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
         let tree_cloned = tree.clone();
         let barrier = barrier.clone();
         let cfg_cloned = cfg.clone();
-        handles.push(std::thread::spawn(move || -> ferric_cache::Result<(u64, u64)> {
-            set_worker_id(tid as u16);
-            if tid == 0 {
-                // single-threaded load to reduce contention
-                for i in 0..cfg_cloned.data_size {
-                    let key = i.to_le_bytes();
-                    let value = key;
-                    tree_cloned.insert(&key, &value)?;
+        let ops_shared = ops_counter.clone();
+        handles.push(std::thread::spawn(
+            move || -> ferric_cache::Result<(u64, u64)> {
+                set_worker_id(tid as u16);
+                if tid == 0 {
+                    // single-threaded load to reduce contention
+                    for i in 0..cfg_cloned.data_size {
+                        let key = i.to_le_bytes();
+                        let value = key;
+                        tree_cloned.insert(&key, &value)?;
+                    }
                 }
-            }
-            // simple barrier: wait for loader to finish
-            barrier.wait();
+                // simple barrier: wait for loader to finish
+                barrier.wait();
 
-            let start = Instant::now();
-            let deadline = start + Duration::from_secs(cfg_cloned.run_for);
-            let mut rng = StdRng::seed_from_u64(42 + tid);
-            let dist = Uniform::from(0..cfg_cloned.data_size);
-            let mut ops = 0u64;
-            while Instant::now() < deadline {
-                let k = dist.sample(&mut rng);
-                let key = k.to_le_bytes();
-                let ok = tree_cloned.lookup(&key, |_| {});
-                assert!(ok, "key should exist");
-                ops += 1;
-            }
-            let elapsed = Instant::now() - start;
-            Ok((ops, elapsed.as_micros() as u64))
-        }));
+                let start = Instant::now();
+                let deadline = start + Duration::from_secs(cfg_cloned.run_for);
+                let mut rng = StdRng::seed_from_u64(42 + tid);
+                let dist = Uniform::from(0..cfg_cloned.data_size);
+                let mut ops = 0u64;
+                while Instant::now() < deadline {
+                    let k = dist.sample(&mut rng);
+                    let key = k.to_le_bytes();
+                    let ok = tree_cloned.lookup(&key, |_| {});
+                    assert!(ok, "key should exist");
+                    ops += 1;
+                    ops_shared.fetch_add(1, Ordering::Relaxed);
+                }
+                let elapsed = Instant::now() - start;
+                Ok((ops, elapsed.as_micros() as u64))
+            },
+        ));
     }
 
     let mut total_ops = 0u64;
@@ -163,7 +218,11 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
         .as_ref()
         .map(|w| w.iter().map(|s| s.evicts).sum::<u64>())
         .unwrap_or(0);
-    let hit_rate = if total_ops == 0 { 0.0 } else { 1.0 - (total_faults as f64 / total_ops as f64) };
+    let hit_rate = if total_ops == 0 {
+        0.0
+    } else {
+        1.0 - (total_faults as f64 / total_ops as f64)
+    };
     println!(
         "threads={}, ops_total={}, throughput={:.2} ops/s, faults={}, hit_rate={:.4}, evicts={}, writes={}",
         cfg.threads,
@@ -176,13 +235,29 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
     );
     stop.store(true, Ordering::Relaxed);
     for (i, (ops, time_us)) in per_thread.iter().enumerate() {
-        let tput = if *time_us == 0 { 0.0 } else { *ops as f64 / (*time_us as f64 / 1_000_000.0) };
+        let tput = if *time_us == 0 {
+            0.0
+        } else {
+            *ops as f64 / (*time_us as f64 / 1_000_000.0)
+        };
         println!("thread {}: ops={}, throughput={:.2} ops/s", i, ops, tput);
     }
     if let Some(bg) = stats.bgwrite {
         println!(
             "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}, errors_enospc={}, errors_eio={}, batches={}, max_batch={}, queue={}, inflight={}, wait_park={}, retries={}",
-            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors, bg.errors_enospc, bg.errors_eio, bg.batches, bg.max_batch, bg.queue_len, bg.inflight, bg.wait_park, bg.retries
+            bg.enqueued,
+            bg.completed,
+            bg.saturated,
+            bg.fallback_sync,
+            bg.errors,
+            bg.errors_enospc,
+            bg.errors_eio,
+            bg.batches,
+            bg.max_batch,
+            bg.queue_len,
+            bg.inflight,
+            bg.wait_park,
+            bg.retries
         );
         if let Some(ioq) = &bg.io_queues {
             for (i, q) in ioq.queues.iter().enumerate() {
@@ -201,14 +276,32 @@ fn run_random_read(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: 
 }
 
 /// TPCC-like mixed workload (simplified) using the B+Tree as backing store.
-fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -> ferric_cache::Result<()> {
+fn run_tpcc(
+    cfg: Config,
+    bm: Arc<BufferManager>,
+    tree: BTree,
+    exmap_tag: &str,
+) -> ferric_cache::Result<()> {
     let warehouses = cfg.data_size; // interpret datasize as number of warehouses
     let districts_per_wh = 10u64;
     let customers_per_dist = 100u64;
     println!(
         "tpcc bench: wh={}, districts/wh={}, customers/dist={}, threads={}, run_for={}s, phys_gb={}, virt_gb={}, region={}, bgwrite={}",
-        warehouses, districts_per_wh, customers_per_dist, cfg.threads, cfg.run_for, cfg.phys_gb, cfg.virt_gb, exmap_tag, cfg.bg_write
+        warehouses,
+        districts_per_wh,
+        customers_per_dist,
+        cfg.threads,
+        cfg.run_for,
+        cfg.phys_gb,
+        cfg.virt_gb,
+        exmap_tag,
+        cfg.bg_write
     );
+    let system_tag = if exmap_tag == "exmap" {
+        "ferric-exmap".to_string()
+    } else {
+        "ferric".to_string()
+    };
 
     // Preload base tables (customer balances).
     {
@@ -225,7 +318,10 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
 
     // Optional periodic stats printer (env STATS_INTERVAL_SECS).
     let stop = Arc::new(AtomicBool::new(false));
-    let stats_intv = env::var("STATS_INTERVAL_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+    let stats_intv = env::var("STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1);
     let shared_counters = Arc::new(TpccCountersAtomic::default());
     if stats_intv > 0 {
         let bm_stats = bm.clone();
@@ -233,38 +329,77 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
         let counters = shared_counters.clone();
         let csv = StatsCsv::new();
         let start = Instant::now();
+        let threads = cfg.threads;
+        let data_size = cfg.data_size;
+        let batch = cfg.batch;
+        let system_tag = system_tag.clone();
+        let workload = "tpcc".to_string();
         thread::spawn(move || {
+            let mut last_reads = 0u64;
+            let mut last_writes = 0u64;
+            let mut last_ops = 0u64;
+            let intv_dur = Duration::from_secs(stats_intv);
+            let intv_secs = stats_intv as f64;
+            println!("ts,tx,rmb,wmb,system,threads,datasize,workload,batch");
             while !stop_flag.load(Ordering::Relaxed) {
                 bm_stats.poll_bg_completions();
                 let snap = bm_stats.stats_snapshot();
-                let total_reads = snap.worker.as_ref().map(|w| w.iter().map(|s| s.reads).sum::<u64>()).unwrap_or(0);
-                let total_faults = snap.worker.as_ref().map(|w| w.iter().map(|s| s.faults).sum::<u64>()).unwrap_or(0);
-                let total_writes = snap.worker.as_ref().map(|w| w.iter().map(|s| s.writes).sum::<u64>()).unwrap_or(0);
-                let total_evicts = snap.worker.as_ref().map(|w| w.iter().map(|s| s.evicts).sum::<u64>()).unwrap_or(0);
-                let hit_rate = if total_reads == 0 { 0.0 } else { 1.0 - (total_faults as f64 / total_reads as f64) };
+                let total_reads = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.reads).sum::<u64>())
+                    .unwrap_or(0);
+                let total_faults = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.faults).sum::<u64>())
+                    .unwrap_or(0);
+                let total_writes = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.writes).sum::<u64>())
+                    .unwrap_or(0);
+                let total_evicts = snap
+                    .worker
+                    .as_ref()
+                    .map(|w| w.iter().map(|s| s.evicts).sum::<u64>())
+                    .unwrap_or(0);
+                let delta_reads = total_reads.saturating_sub(last_reads);
+                let delta_writes = total_writes.saturating_sub(last_writes);
                 let bg = snap.bgwrite.unwrap_or_default();
                 let live = counters.snapshot();
+                let delta_ops = live.ops.saturating_sub(last_ops);
+                let rmb = delta_reads as f64 * ferric_cache::memory::PAGE_SIZE as f64
+                    / 1_000_000.0
+                    / intv_secs;
+                let wmb = delta_writes as f64 * ferric_cache::memory::PAGE_SIZE as f64
+                    / 1_000_000.0
+                    / intv_secs;
                 println!(
-                    "[stats] reads={}, faults={}, hit_rate={:.4}, evicts={}, writes={}, phys_used={}, bg_queue={}, bg_inflight={}, bg_done={}, bg_enq={}, bg_err={}, new_order={}, payment={}, order_status={}, stock_level={}, delivery={}",
+                    "{},{:.2},{:.4},{:.4},{},{},{},{},{}",
+                    start.elapsed().as_secs(),
+                    delta_ops as f64 / intv_secs,
+                    rmb,
+                    wmb,
+                    system_tag,
+                    threads,
+                    data_size,
+                    workload,
+                    batch
+                );
+                csv.log(
+                    start.elapsed(),
                     total_reads,
                     total_faults,
-                    hit_rate,
                     total_evicts,
                     total_writes,
-                    snap.phys_used,
-                    bg.queue_len,
-                    bg.inflight,
-                    bg.completed,
-                    bg.enqueued,
-                    bg.errors,
-                    live.new_order,
-                    live.payment,
-                    live.order_status,
-                    live.stock_level,
-                    live.delivery,
+                    &bg,
+                    &snap.exmap,
                 );
-                csv.log(start.elapsed(), total_reads, total_faults, total_evicts, total_writes, &bg, &snap.exmap);
-                thread::sleep(Duration::from_secs(stats_intv));
+                last_reads = total_reads;
+                last_writes = total_writes;
+                last_ops = live.ops;
+                thread::sleep(intv_dur);
             }
         });
     }
@@ -277,95 +412,97 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
         let barrier = barrier.clone();
         let cfg_cloned = cfg.clone();
         let counters_shared = shared_counters.clone();
-        handles.push(thread::spawn(move || -> ferric_cache::Result<(TpccCounters, u64)> {
-            set_worker_id(tid as u16);
-            barrier.wait();
-            let mut rng = StdRng::seed_from_u64(99 + tid);
-            let mix = WeightedIndex::new(&[45, 43, 4, 4, 4]).unwrap(); // new_order, payment, order_status, stock_level, delivery
-            let warehouses = cfg_cloned.data_size;
-            let cust_dist = Uniform::from(0..customers_per_dist);
-            let dist_dist = Uniform::from(0..districts_per_wh);
-            let wh_dist = Uniform::from(0..warehouses);
-            let mut counters = TpccCounters::default();
-            let start = Instant::now();
-            let deadline = start + Duration::from_secs(cfg_cloned.run_for);
-            let mut next_order_id: u64 = 1;
-            while Instant::now() < deadline {
-                match mix.sample(&mut rng) {
-                    0 => {
-                        // new order: insert order row
-                        let wh = wh_dist.sample(&mut rng);
-                        let dist = dist_dist.sample(&mut rng);
-                        let key = order_key(wh, dist, next_order_id);
-                        let payload = next_order_id.to_le_bytes();
-                        let _ = tree_cloned.insert(&key, &payload);
-                        next_order_id = next_order_id.wrapping_add(1);
-                        counters.new_order += 1;
-                        counters_shared.new_order.fetch_add(1, Ordering::Relaxed);
-                    }
-                    1 => {
-                        // payment: update customer balance (decrement)
-                        let wh = wh_dist.sample(&mut rng);
-                        let dist = dist_dist.sample(&mut rng);
-                        let cust = cust_dist.sample(&mut rng);
-                        let key = customer_key(wh, dist, cust);
-                        let mut found = false;
-                        let _ = tree_cloned.lookup(&key, |p| {
-                            let mut val_arr = [0u8; 8];
-                            val_arr.copy_from_slice(&p[..8]);
-                            let mut balance = u64::from_le_bytes(val_arr);
-                            balance = balance.saturating_sub(1);
-                            let _ = tree_cloned.insert(&key, &balance.to_le_bytes());
-                            found = true;
-                        });
-                        if !found {
-                            // initialize if missing
-                            let _ = tree_cloned.insert(&key, &1_000u64.to_le_bytes());
-                        }
-                        counters.payment += 1;
-                        counters_shared.payment.fetch_add(1, Ordering::Relaxed);
-                    }
-                    2 => {
-                        // order status: lookup customer
-                        let wh = wh_dist.sample(&mut rng);
-                        let dist = dist_dist.sample(&mut rng);
-                        let cust = cust_dist.sample(&mut rng);
-                        let key = customer_key(wh, dist, cust);
-                        let _ = tree_cloned.lookup(&key, |_| {});
-                        counters.order_status += 1;
-                        counters_shared.order_status.fetch_add(1, Ordering::Relaxed);
-                    }
-                    3 => {
-                        // stock level: scan a small range of orders
-                        let wh = wh_dist.sample(&mut rng);
-                        let dist = dist_dist.sample(&mut rng);
-                        let start_key = order_key(wh, dist, 0);
-                        let mut seen = 0;
-                        tree_cloned.scan_asc(&start_key, |_k, _p| {
-                            seen += 1;
-                            seen < 20 // stop after small batch
-                        });
-                        counters.stock_level += 1;
-                        counters_shared.stock_level.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {
-                        // delivery: delete last order if exists
-                        if next_order_id > 0 {
+        handles.push(thread::spawn(
+            move || -> ferric_cache::Result<(TpccCounters, u64)> {
+                set_worker_id(tid as u16);
+                barrier.wait();
+                let mut rng = StdRng::seed_from_u64(99 + tid);
+                let mix = WeightedIndex::new(&[45, 43, 4, 4, 4]).unwrap(); // new_order, payment, order_status, stock_level, delivery
+                let warehouses = cfg_cloned.data_size;
+                let cust_dist = Uniform::from(0..customers_per_dist);
+                let dist_dist = Uniform::from(0..districts_per_wh);
+                let wh_dist = Uniform::from(0..warehouses);
+                let mut counters = TpccCounters::default();
+                let start = Instant::now();
+                let deadline = start + Duration::from_secs(cfg_cloned.run_for);
+                let mut next_order_id: u64 = 1;
+                while Instant::now() < deadline {
+                    match mix.sample(&mut rng) {
+                        0 => {
+                            // new order: insert order row
                             let wh = wh_dist.sample(&mut rng);
                             let dist = dist_dist.sample(&mut rng);
-                            let key = order_key(wh, dist, next_order_id.saturating_sub(1));
-                            let _ = tree_cloned.delete(&key);
+                            let key = order_key(wh, dist, next_order_id);
+                            let payload = next_order_id.to_le_bytes();
+                            let _ = tree_cloned.insert(&key, &payload);
+                            next_order_id = next_order_id.wrapping_add(1);
+                            counters.new_order += 1;
+                            counters_shared.new_order.fetch_add(1, Ordering::Relaxed);
                         }
-                        counters.delivery += 1;
-                        counters_shared.delivery.fetch_add(1, Ordering::Relaxed);
+                        1 => {
+                            // payment: update customer balance (decrement)
+                            let wh = wh_dist.sample(&mut rng);
+                            let dist = dist_dist.sample(&mut rng);
+                            let cust = cust_dist.sample(&mut rng);
+                            let key = customer_key(wh, dist, cust);
+                            let mut found = false;
+                            let _ = tree_cloned.lookup(&key, |p| {
+                                let mut val_arr = [0u8; 8];
+                                val_arr.copy_from_slice(&p[..8]);
+                                let mut balance = u64::from_le_bytes(val_arr);
+                                balance = balance.saturating_sub(1);
+                                let _ = tree_cloned.insert(&key, &balance.to_le_bytes());
+                                found = true;
+                            });
+                            if !found {
+                                // initialize if missing
+                                let _ = tree_cloned.insert(&key, &1_000u64.to_le_bytes());
+                            }
+                            counters.payment += 1;
+                            counters_shared.payment.fetch_add(1, Ordering::Relaxed);
+                        }
+                        2 => {
+                            // order status: lookup customer
+                            let wh = wh_dist.sample(&mut rng);
+                            let dist = dist_dist.sample(&mut rng);
+                            let cust = cust_dist.sample(&mut rng);
+                            let key = customer_key(wh, dist, cust);
+                            let _ = tree_cloned.lookup(&key, |_| {});
+                            counters.order_status += 1;
+                            counters_shared.order_status.fetch_add(1, Ordering::Relaxed);
+                        }
+                        3 => {
+                            // stock level: scan a small range of orders
+                            let wh = wh_dist.sample(&mut rng);
+                            let dist = dist_dist.sample(&mut rng);
+                            let start_key = order_key(wh, dist, 0);
+                            let mut seen = 0;
+                            tree_cloned.scan_asc(&start_key, |_k, _p| {
+                                seen += 1;
+                                seen < 20 // stop after small batch
+                            });
+                            counters.stock_level += 1;
+                            counters_shared.stock_level.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            // delivery: delete last order if exists
+                            if next_order_id > 0 {
+                                let wh = wh_dist.sample(&mut rng);
+                                let dist = dist_dist.sample(&mut rng);
+                                let key = order_key(wh, dist, next_order_id.saturating_sub(1));
+                                let _ = tree_cloned.delete(&key);
+                            }
+                            counters.delivery += 1;
+                            counters_shared.delivery.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                    counters.ops += 1;
+                    counters_shared.ops.fetch_add(1, Ordering::Relaxed);
                 }
-                counters.ops += 1;
-                counters_shared.ops.fetch_add(1, Ordering::Relaxed);
-            }
-            let elapsed = Instant::now() - start;
-            Ok((counters, elapsed.as_micros() as u64))
-        }));
+                let elapsed = Instant::now() - start;
+                Ok((counters, elapsed.as_micros() as u64))
+            },
+        ));
     }
 
     let mut total = TpccCounters::default();
@@ -380,11 +517,22 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
 
     let stats = bm.stats_snapshot();
     let elapsed_s = max_time_us as f64 / 1_000_000.0;
+    // VMCache-style summary line
+    let tx_per_sec = total.ops as f64 / elapsed_s;
+    let rmb = stats.reads as f64 * ferric_cache::memory::PAGE_SIZE as f64 / 1_000_000.0 / elapsed_s;
+    let wmb =
+        stats.writes as f64 * ferric_cache::memory::PAGE_SIZE as f64 / 1_000_000.0 / elapsed_s;
+    println!("ts,tx,rmb,wmb,system,threads,datasize,workload,batch");
     println!(
-        "tpcc summary: threads={}, ops_total={}, throughput={:.2} ops/s (new_order={}, payment={}, order_status={}, stock_level={}, delivery={})",
+        "{:.0},{:.2},{:.4},{:.4},{},{},{},{}",
+        elapsed_s, tx_per_sec, rmb, wmb, system_tag, cfg.threads, cfg.data_size, cfg.batch
+    );
+
+    println!(
+        "tpcc summary: threads={}, tx_total={}, tx_throughput={:.2} tx/s (new_order={}, payment={}, order_status={}, stock_level={}, delivery={})",
         cfg.threads,
         total.ops,
-        total.ops as f64 / elapsed_s,
+        tx_per_sec,
         total.new_order,
         total.payment,
         total.order_status,
@@ -415,7 +563,11 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
         stats.bgwrite.as_ref().map(|b| b.queue_len).unwrap_or(0)
     );
     for (i, (c, time_us)) in per_thread.iter().enumerate() {
-        let tput = if *time_us == 0 { 0.0 } else { c.ops as f64 / (*time_us as f64 / 1_000_000.0) };
+        let tput = if *time_us == 0 {
+            0.0
+        } else {
+            c.ops as f64 / (*time_us as f64 / 1_000_000.0)
+        };
         println!(
             "thread {}: ops={}, tput={:.2} (new_order={}, payment={}, order_status={}, stock_level={}, delivery={})",
             i, c.ops, tput, c.new_order, c.payment, c.order_status, c.stock_level, c.delivery
@@ -424,7 +576,15 @@ fn run_tpcc(cfg: Config, bm: Arc<BufferManager>, tree: BTree, exmap_tag: &str) -
     if let Some(bg) = stats.bgwrite {
         println!(
             "bgwrite: enq={}, done={}, saturated={}, fallback_sync={}, errors={}, batches={}, max_batch={}, queue={}, inflight={}",
-            bg.enqueued, bg.completed, bg.saturated, bg.fallback_sync, bg.errors, bg.batches, bg.max_batch, bg.queue_len, bg.inflight
+            bg.enqueued,
+            bg.completed,
+            bg.saturated,
+            bg.fallback_sync,
+            bg.errors,
+            bg.batches,
+            bg.max_batch,
+            bg.queue_len,
+            bg.inflight
         );
     }
     println!(
@@ -490,9 +650,14 @@ impl StatsCsv {
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
                 // write header if file is empty
                 if f.metadata().map(|m| m.len()).unwrap_or(1) == 0 {
-                    let _ = writeln!(f, "secs,reads,faults,evicts,writes,bg_queue,bg_inflight,bg_done,bg_enq,bg_err,exmap_active");
+                    let _ = writeln!(
+                        f,
+                        "secs,reads,faults,evicts,writes,bg_queue,bg_inflight,bg_done,bg_enq,bg_err,exmap_active"
+                    );
                 }
-                return Self { file: Some(std::sync::Mutex::new(f)) };
+                return Self {
+                    file: Some(std::sync::Mutex::new(f)),
+                };
             }
         }
         Self { file: None }

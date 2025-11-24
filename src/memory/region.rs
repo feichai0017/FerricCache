@@ -1,7 +1,7 @@
-use crate::memory::page::Page;
-use crate::memory::PAGE_SIZE;
 use crate::Result;
-use libc::{c_void, mmap, munmap, MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use crate::memory::PAGE_SIZE;
+use crate::memory::page::Page;
+use libc::{MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE, c_void, mmap, munmap};
 use std::ptr::NonNull;
 
 /// Mmap-backed region used to host page-aligned `Page` objects.

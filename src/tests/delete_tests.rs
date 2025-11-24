@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 #[test]
 fn duplicate_overwrites() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_dup".to_string(), 8, 8, 2).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_dup".to_string(), 8, 8, 2).unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     tree.insert(b"k1", b"v1").unwrap();
     tree.insert(b"k1", b"v2").unwrap(); // overwrite
@@ -18,7 +20,9 @@ fn duplicate_overwrites() {
 
 #[test]
 fn delete_single_leaf() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_delete".to_string(), 8, 8, 2).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_delete".to_string(), 8, 8, 2).unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     tree.insert(b"k1", b"v1").unwrap();
     tree.insert(b"k2", b"v2").unwrap();
@@ -29,7 +33,10 @@ fn delete_single_leaf() {
 
 #[test]
 fn delete_triggers_merge() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_delete_merge".to_string(), 32, 16, 4).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_delete_merge".to_string(), 32, 16, 4)
+            .unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     // Insert enough to split
     for i in 0u8..20 {
@@ -52,7 +59,10 @@ fn delete_triggers_merge() {
 
 #[test]
 fn delete_merge_with_left_sibling() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_delete_merge_left".to_string(), 32, 16, 4).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_delete_merge_left".to_string(), 32, 16, 4)
+            .unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     for i in 0u8..30 {
         let k = [i];
@@ -71,7 +81,10 @@ fn delete_merge_with_left_sibling() {
 
 #[test]
 fn deep_delete_separators_correct() {
-    let bm = Arc::new(BufferManager::new_with_pages("/tmp/ferric_btree_delete_deep".to_string(), 64, 32, 4).unwrap());
+    let bm = Arc::new(
+        BufferManager::new_with_pages("/tmp/ferric_btree_delete_deep".to_string(), 64, 32, 4)
+            .unwrap(),
+    );
     let tree = BTree::new(bm.clone()).unwrap();
     for i in 0u8..60 {
         tree.insert(&[i], &[i + 1]).unwrap();

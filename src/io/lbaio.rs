@@ -1,16 +1,16 @@
 #[cfg(all(target_os = "linux", feature = "libaio"))]
 mod lbaio_impl {
-    use crate::memory::{page::Page, PAGE_SIZE};
     use crate::Result;
+    use crate::memory::{PAGE_SIZE, page::Page};
     use crate::thread_local::get_worker_id;
+    use crossbeam_channel::{Receiver, Sender};
     use libc::c_void;
-    use std::io;
     use std::fs::File;
+    use std::io;
     use std::os::fd::AsRawFd;
+    use std::ptr;
     use std::slice;
     use std::sync::Arc;
-    use std::ptr;
-    use crossbeam_channel::{Sender, Receiver};
 
     /// Minimal `io_event` mirror (not provided by libc).
     #[repr(C)]
@@ -47,7 +47,14 @@ mod lbaio_impl {
         if cbs.is_empty() {
             return Ok(0);
         }
-        let ret = unsafe { libc::syscall(libc::SYS_io_submit, ctx, cbs.len() as libc::c_long, cbs.as_mut_ptr()) };
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_submit,
+                ctx,
+                cbs.len() as libc::c_long,
+                cbs.as_mut_ptr(),
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -55,10 +62,23 @@ mod lbaio_impl {
     }
 
     #[inline]
-    fn io_getevents(ctx: AioContext, min_nr: usize, nr: usize, events: &mut [IoEvent], timeout_ns: i64) -> Result<usize> {
+    fn io_getevents(
+        ctx: AioContext,
+        min_nr: usize,
+        nr: usize,
+        events: &mut [IoEvent],
+        timeout_ns: i64,
+    ) -> Result<usize> {
         debug_assert!(nr <= events.len());
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: timeout_ns };
-        let ts_ptr = if timeout_ns > 0 { &mut ts as *mut libc::timespec } else { ptr::null_mut() };
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: timeout_ns,
+        };
+        let ts_ptr = if timeout_ns > 0 {
+            &mut ts as *mut libc::timespec
+        } else {
+            ptr::null_mut()
+        };
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_io_getevents,
@@ -94,7 +114,12 @@ mod lbaio_impl {
     }
 
     impl LibaioIo {
-        pub fn open(file: File, max_ios: usize, workers: usize, affinity: Option<Vec<usize>>) -> Result<Arc<Self>> {
+        pub fn open(
+            file: File,
+            max_ios: usize,
+            workers: usize,
+            affinity: Option<Vec<usize>>,
+        ) -> Result<Arc<Self>> {
             let mut ctx: AioContext = 0;
             io_setup(max_ios, &mut ctx)?;
             let mut senders = Vec::with_capacity(workers.max(1));
@@ -102,7 +127,14 @@ mod lbaio_impl {
             for _ in 0..workers.max(1) {
                 queue_stats.push(IoQueueCounters::default());
             }
-            let io = Arc::new(Self { file, ctx, _max_ios: max_ios, async_tx: Vec::new(), affinity: affinity.clone(), queue_stats });
+            let io = Arc::new(Self {
+                file,
+                ctx,
+                _max_ios: max_ios,
+                async_tx: Vec::new(),
+                affinity: affinity.clone(),
+                queue_stats,
+            });
             for i in 0..workers.max(1) {
                 let (tx, rx) = crossbeam_channel::bounded::<AsyncReq>(max_ios.max(1));
                 senders.push(tx);
@@ -115,7 +147,11 @@ mod lbaio_impl {
                         unsafe {
                             libc::CPU_ZERO(&mut set);
                             libc::CPU_SET(cpu, &mut set);
-                            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                            libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &set,
+                            );
                         }
                     }
                     io_clone.async_worker(rx);
@@ -175,9 +211,15 @@ mod lbaio_impl {
                             let ptr = buf.as_ptr() as *const Page;
                             let _ = self.write_page(*pid, ptr);
                         }
-                        let _ = req.done.send(Err(e));
-                        self.queue_stats[req.queue_idx].fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Err("io_submit failed".into());
+                        let raw = e.raw_os_error();
+                        let err = raw
+                            .map(io::Error::from_raw_os_error)
+                            .unwrap_or(e);
+                        let _ = req.done.send(Err(err));
+                        self.queue_stats[req.queue_idx]
+                            .fail
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(io::Error::from_raw_os_error(libc::EIO).into());
                     }
                 }
             }
@@ -187,14 +229,29 @@ mod lbaio_impl {
                     let ptr = buf.as_ptr() as *const Page;
                     let _ = self.write_page(pid, ptr);
                 }
-                let _ = req.done.send(Err("io_submit returned 0".into()));
-                return Err("io_submit returned 0".into());
+                let err = io::Error::from_raw_os_error(libc::EAGAIN);
+                let _ = req.done.send(Err(err));
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN).into());
             }
-            let mut events: Vec<IoEvent> = vec![IoEvent { data: 0, obj: 0, res: 0, res2: 0 }; submitted];
+            let mut events: Vec<IoEvent> = vec![
+                IoEvent {
+                    data: 0,
+                    obj: 0,
+                    res: 0,
+                    res2: 0
+                };
+                submitted
+            ];
             let mut completed = 0usize;
             let mut idle_polls = 0;
             while completed < submitted {
-                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 500_000)?;
+                let ret = io_getevents(
+                    self.ctx,
+                    1,
+                    submitted - completed,
+                    &mut events[completed..],
+                    500_000,
+                )?;
                 if ret == 0 {
                     idle_polls += 1;
                     if idle_polls > 10 {
@@ -210,9 +267,12 @@ mod lbaio_impl {
                     let ptr = buf.as_ptr() as *const Page;
                     let _ = self.write_page(pid, ptr);
                 }
-                let _ = req.done.send(Err("io_getevents timeout".into()));
-                self.queue_stats[req.queue_idx].timeout.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err("io_getevents timeout".into());
+                let err = io::Error::from_raw_os_error(libc::ETIMEDOUT);
+                let _ = req.done.send(Err(err));
+                self.queue_stats[req.queue_idx]
+                    .timeout
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT).into());
             }
             let mut ok = true;
             for ev in events.iter().take(completed) {
@@ -230,9 +290,12 @@ mod lbaio_impl {
                     let ptr = buf.as_ptr() as *const Page;
                     let _ = self.write_page(pid, ptr);
                 }
-                let _ = req.done.send(Err("async write error".into()));
-                self.queue_stats[req.queue_idx].retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err("async write error".into())
+                let err = io::Error::from_raw_os_error(libc::EIO);
+                let _ = req.done.send(Err(err));
+                self.queue_stats[req.queue_idx]
+                    .retries
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(io::Error::from_raw_os_error(libc::EIO).into())
             }
         }
     }
@@ -258,9 +321,16 @@ mod lbaio_impl {
             let buf = unsafe { slice::from_raw_parts_mut(dst as *mut u8, PAGE_SIZE) };
             let mut done = 0;
             while done < buf.len() {
-                let n = unsafe { libc::pread(fd, buf.as_mut_ptr().add(done) as *mut c_void, (buf.len() - done) as usize, (pid * PAGE_SIZE as u64 + done as u64) as i64) };
+                let n = unsafe {
+                    libc::pread(
+                        fd,
+                        buf.as_mut_ptr().add(done) as *mut c_void,
+                        (buf.len() - done) as usize,
+                        (pid * PAGE_SIZE as u64 + done as u64) as i64,
+                    )
+                };
                 if n <= 0 {
-                    return Err("pread failed".into());
+                    return Err(io::Error::last_os_error().into());
                 }
                 done += n as usize;
             }
@@ -272,9 +342,16 @@ mod lbaio_impl {
             let buf = unsafe { slice::from_raw_parts(src as *const u8, PAGE_SIZE) };
             let mut done = 0;
             while done < buf.len() {
-                let n = unsafe { libc::pwrite(fd, buf.as_ptr().add(done) as *const c_void, (buf.len() - done) as usize, (pid * PAGE_SIZE as u64 + done as u64) as i64) };
+                let n = unsafe {
+                    libc::pwrite(
+                        fd,
+                        buf.as_ptr().add(done) as *const c_void,
+                        (buf.len() - done) as usize,
+                        (pid * PAGE_SIZE as u64 + done as u64) as i64,
+                    )
+                };
                 if n <= 0 {
-                    return Err("pwrite failed".into());
+                    return Err(io::Error::last_os_error().into());
                 }
                 done += n as usize;
             }
@@ -334,15 +411,29 @@ mod lbaio_impl {
                 for &pid in pids {
                     self.write_page(pid, unsafe { base.add(pid as usize) })?;
                 }
-                return Ok(());
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN).into());
             }
 
-            let mut events: Vec<IoEvent> = vec![IoEvent { data: 0, obj: 0, res: 0, res2: 0 }; submitted];
+            let mut events: Vec<IoEvent> = vec![
+                IoEvent {
+                    data: 0,
+                    obj: 0,
+                    res: 0,
+                    res2: 0
+                };
+                submitted
+            ];
             let mut completed = 0usize;
             let mut idle_polls = 0;
             // Poll with short timeout; if repeatedly idle, fall back to synchronous completion.
             while completed < submitted {
-                let ret = io_getevents(self.ctx, 1, submitted - completed, &mut events[completed..], 500_000)?; // 0.5 ms timeout
+                let ret = io_getevents(
+                    self.ctx,
+                    1,
+                    submitted - completed,
+                    &mut events[completed..],
+                    500_000,
+                )?; // 0.5 ms timeout
                 if ret == 0 {
                     idle_polls += 1;
                     if idle_polls > 10 {
@@ -359,7 +450,7 @@ mod lbaio_impl {
                     let ptr = unsafe { base.add(pid as usize) };
                     self.write_page(pid, ptr)?;
                 }
-                return Err("io_getevents timeout".into());
+                return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT).into());
             }
             let mut failures = Vec::new();
             for ev in events.iter().take(completed) {
@@ -376,9 +467,7 @@ mod lbaio_impl {
                         }
                     }
                 }
-                if let Some(e) = first_err {
-                    return Err(e);
-                }
+                return Err(first_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO).into()));
             }
             Ok(())
         }
@@ -392,12 +481,20 @@ mod lbaio_impl {
                 return None;
             }
             let idx = (get_worker_id() as usize) % self.async_tx.len();
-            let req = AsyncReq { queue_idx: idx, bufs, done: tx };
-            self.queue_stats[idx].submit.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let req = AsyncReq {
+                queue_idx: idx,
+                bufs,
+                done: tx,
+            };
+            self.queue_stats[idx]
+                .submit
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.async_tx[idx].try_send(req) {
                 Ok(_) => Some(rx),
                 Err(_) => {
-                    self.queue_stats[idx].fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.queue_stats[idx]
+                        .fail
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     None
                 }
             }

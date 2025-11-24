@@ -1,4 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// Page lock state bits stored in the top 8 bits of the 64-bit word.
 pub mod state {
@@ -13,12 +15,14 @@ pub mod state {
 #[derive(Debug)]
 pub struct PageState {
     state_and_version: AtomicU64,
+    wait_cv: Arc<(Mutex<()>, Condvar)>,
 }
 
 impl PageState {
     pub fn new() -> Self {
         Self {
             state_and_version: AtomicU64::new(0),
+            wait_cv: Arc::new((Mutex::new(()), Condvar::new())),
         }
     }
 
@@ -57,22 +61,33 @@ impl PageState {
     /// Attempt to transition to X-locked while keeping version.
     pub fn try_lock_x(&self, expected: u64) -> bool {
         self.state_and_version
-            .compare_exchange(expected, Self::with_same_version(expected, state::LOCKED), Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                expected,
+                Self::with_same_version(expected, state::LOCKED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
     pub fn unlock_x(&self) {
         let current = self.load();
         debug_assert_eq!(Self::state(current), state::LOCKED);
-        self.state_and_version
-            .store(Self::with_next_version(current, state::UNLOCKED), Ordering::Release);
+        self.state_and_version.store(
+            Self::with_next_version(current, state::UNLOCKED),
+            Ordering::Release,
+        );
+        self.wait_cv.1.notify_all();
     }
 
     pub fn unlock_x_evicted(&self) {
         let current = self.load();
         debug_assert_eq!(Self::state(current), state::LOCKED);
-        self.state_and_version
-            .store(Self::with_next_version(current, state::EVICTED), Ordering::Release);
+        self.state_and_version.store(
+            Self::with_next_version(current, state::EVICTED),
+            Ordering::Release,
+        );
+        self.wait_cv.1.notify_all();
     }
 
     /// Downgrade X lock to a single shared holder.
@@ -128,9 +143,8 @@ impl PageState {
                 .compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // If we just released the last shared lock, notify potential parkers.
                 if s == 1 {
-                    std::thread::yield_now();
+                    self.wait_cv.1.notify_all();
                 }
                 return;
             }
@@ -148,6 +162,14 @@ impl PageState {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Park briefly waiting for unlock; best effort to reduce contention.
+    pub fn wait_for_unlock(&self, dur: Duration) {
+        let (lock, cv) = (&self.wait_cv.0, &self.wait_cv.1);
+        if let Ok(guard) = lock.lock() {
+            let _ = cv.wait_timeout(guard, dur);
+        }
     }
 
     #[inline]

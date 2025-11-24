@@ -1,10 +1,10 @@
-use crate::memory::page::Page;
-use crate::memory::PAGE_SIZE;
 use crate::Result;
-use libc::{c_void, mmap, munmap, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
-use std::ptr::NonNull;
+use crate::memory::PAGE_SIZE;
+use crate::memory::page::Page;
+use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, c_void, mmap, munmap};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::ptr::NonNull;
 
 /// Minimal exmap-backed region shim. On Linux we attempt to mmap via /dev/exmap;
 /// on other platforms we return an error so callers can fall back to mmap.

@@ -1,6 +1,6 @@
+use crate::Result;
 use crate::memory::page::Page;
 use crate::memory::{exmap::ExmapRegion, region::MmapRegion};
-use crate::Result;
 
 /// Abstraction over the backing virtual memory region (mmap or exmap).
 pub enum VirtualRegion {
@@ -45,7 +45,10 @@ impl VirtualRegion {
 }
 
 /// Helper to construct a region honoring the exmap flag with graceful fallback.
-pub fn create_region(page_count: usize, use_exmap: bool) -> Result<(VirtualRegion, RegionKind, Option<String>)> {
+pub fn create_region(
+    page_count: usize,
+    use_exmap: bool,
+) -> Result<(VirtualRegion, RegionKind, Option<String>)> {
     let mut reason = None;
     if use_exmap {
         match ExmapRegion::probe().and_then(|_| VirtualRegion::exmap(page_count)) {

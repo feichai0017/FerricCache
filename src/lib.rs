@@ -1,9 +1,9 @@
-pub mod config;
-pub mod memory;
-pub mod buffer_manager;
-pub mod guard;
 pub mod btree;
+pub mod buffer_manager;
+pub mod config;
+pub mod guard;
 pub mod io;
+pub mod memory;
 pub mod thread_local;
 
 /// Shared result type for fallible operations.

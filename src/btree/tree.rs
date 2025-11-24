@@ -1,7 +1,7 @@
+use super::node::BTreeNode;
+use crate::Result;
 use crate::buffer_manager::BufferManager;
 use crate::guard::{GuardO, GuardX};
-use crate::Result;
-use super::node::BTreeNode;
 use std::sync::Arc;
 
 pub const METADATA_PID: u64 = 0;
@@ -205,7 +205,8 @@ impl BTree {
             }
             let mut meta_x = GuardX::<MetaDataPage>::new_from_pid(self.bm.as_ref(), METADATA_PID);
             meta_x.ptr().root = pid;
-            self.root_pid.store(pid, std::sync::atomic::Ordering::Release);
+            self.root_pid
+                .store(pid, std::sync::atomic::Ordering::Release);
             pid
         } else {
             meta.ptr().root
@@ -260,29 +261,44 @@ impl BTree {
         }
         let mut leaf_x = GuardX::new_from_optimistic(node)?;
         leaf_x.ptr().remove_slot(pos as usize);
-        if leaf_x.ptr().hdr.count == 0 && leaf_x.pid != self.root_pid.load(std::sync::atomic::Ordering::Acquire) {
+        if leaf_x.ptr().hdr.count == 0
+            && leaf_x.pid != self.root_pid.load(std::sync::atomic::Ordering::Acquire)
+        {
             self.rebalance_after_delete_leaf(leaf_x.pid, path)?;
         }
         Ok(true)
     }
 
-    fn rebalance_after_delete_leaf(&self, leaf_pid: u64, mut path: Vec<(GuardO<BTreeNode>, u16)>) -> Result<()> {
+    fn rebalance_after_delete_leaf(
+        &self,
+        leaf_pid: u64,
+        mut path: Vec<(GuardO<BTreeNode>, u16)>,
+    ) -> Result<()> {
         // For now, attempt to borrow/merge with right sibling if parent info exists.
         if let Some((parent_o, pos)) = path.pop() {
             let mut parent_x = GuardX::new_from_optimistic(parent_o)?;
             // Prefer left sibling if exists, otherwise right.
             let left_sibling_pid = if pos > 0 {
-                parent_x.ptr().child_pid((pos - 1) as usize).unwrap_or(u64::MAX)
-            } else { u64::MAX };
+                parent_x
+                    .ptr()
+                    .child_pid((pos - 1) as usize)
+                    .unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            };
             let right_pid = if (pos as usize) < parent_x.ptr().hdr.count as usize {
-                parent_x.ptr().child_pid((pos + 1) as usize).unwrap_or(u64::MAX)
+                parent_x
+                    .ptr()
+                    .child_pid((pos + 1) as usize)
+                    .unwrap_or(u64::MAX)
             } else {
                 u64::MAX
             };
 
             if left_sibling_pid != u64::MAX && left_sibling_pid != leaf_pid {
                 // merge leaf into left sibling
-                let mut left = GuardX::<BTreeNode>::new_from_pid(self.bm.as_ref(), left_sibling_pid);
+                let mut left =
+                    GuardX::<BTreeNode>::new_from_pid(self.bm.as_ref(), left_sibling_pid);
                 let mut leaf = GuardX::<BTreeNode>::new_from_pid(self.bm.as_ref(), leaf_pid);
                 for i in 0..leaf.ptr().hdr.count as usize {
                     let k = leaf.ptr().reconstruct_key(i);
@@ -332,13 +348,20 @@ impl BTree {
         Ok(())
     }
 
-    fn handle_parent_underflow(&self, mut parent_x: GuardX<BTreeNode>, _path: Vec<(GuardO<BTreeNode>, u16)>) -> Result<()> {
+    fn handle_parent_underflow(
+        &self,
+        mut parent_x: GuardX<BTreeNode>,
+        _path: Vec<(GuardO<BTreeNode>, u16)>,
+    ) -> Result<()> {
         // root shrink
-        if parent_x.pid == self.root_pid.load(std::sync::atomic::Ordering::Acquire) && parent_x.ptr().hdr.count == 0 {
+        if parent_x.pid == self.root_pid.load(std::sync::atomic::Ordering::Acquire)
+            && parent_x.ptr().hdr.count == 0
+        {
             // promote only child
             let new_root = parent_x.ptr().hdr.upper_inner;
             if new_root != u64::MAX {
-                self.root_pid.store(new_root, std::sync::atomic::Ordering::Release);
+                self.root_pid
+                    .store(new_root, std::sync::atomic::Ordering::Release);
                 let mut meta = GuardX::<MetaDataPage>::new_from_pid(self.bm.as_ref(), METADATA_PID);
                 meta.ptr().root = new_root;
             }
@@ -369,8 +392,13 @@ impl BTree {
         self.insert_into_parent_from_path(path, left_pid, sep_key, right_pid)
     }
 
-    fn insert_into_parent_from_path(&self, mut path: Vec<(GuardO<BTreeNode>, u16)>, left_pid: u64, sep_key: Vec<u8>, right_pid: u64) -> Result<()> {
-
+    fn insert_into_parent_from_path(
+        &self,
+        mut path: Vec<(GuardO<BTreeNode>, u16)>,
+        left_pid: u64,
+        sep_key: Vec<u8>,
+        right_pid: u64,
+    ) -> Result<()> {
         while let Some((parent_o, pos)) = path.pop() {
             let mut parent_x = GuardX::new_from_optimistic(parent_o)?;
             // Duplicate separator: replace existing mapping to point to new right child.
@@ -379,7 +407,9 @@ impl BTree {
                 let existing_key = parent_x.ptr().reconstruct_key(slot_idx);
                 if existing_key == sep_key {
                     parent_x.ptr().remove_slot(slot_idx);
-                    let ok = parent_x.ptr().insert_in_page(&sep_key, &right_pid.to_le_bytes());
+                    let ok = parent_x
+                        .ptr()
+                        .insert_in_page(&sep_key, &right_pid.to_le_bytes());
                     if ok {
                         self.validate_inner(&mut parent_x)?;
                         return Ok(());
@@ -389,14 +419,17 @@ impl BTree {
                 }
             }
             if parent_x.ptr().has_space_for(sep_key.len(), 8) {
-                let ok = parent_x.ptr().insert_in_page(&sep_key, &right_pid.to_le_bytes());
+                let ok = parent_x
+                    .ptr()
+                    .insert_in_page(&sep_key, &right_pid.to_le_bytes());
                 if ok {
                     self.validate_inner(&mut parent_x)?;
                     return Ok(());
                 }
             }
             // split inner node
-            let (new_sep, new_inner_pid) = self.split_inner(&mut parent_x, sep_key.clone(), right_pid, pos as usize)?;
+            let (new_sep, new_inner_pid) =
+                self.split_inner(&mut parent_x, sep_key.clone(), right_pid, pos as usize)?;
             // propagate upward
             let parent_pid = parent_x.pid;
             drop(parent_x); // release before recursing to avoid self-deadlock
@@ -416,13 +449,16 @@ impl BTree {
             let mut root_x = GuardX::<BTreeNode>::new_from_pid(self.bm.as_ref(), new_root_pid);
             root_x.ptr().hdr.upper_inner = left_pid;
             root_x.ptr().set_fences(&[], &[]);
-            let ok = root_x.ptr().insert_in_page(&sep_key, &right_pid.to_le_bytes());
+            let ok = root_x
+                .ptr()
+                .insert_in_page(&sep_key, &right_pid.to_le_bytes());
             if !ok {
                 return Err("root insert failed".into());
             }
             let mut meta_x = GuardX::<MetaDataPage>::new_from_pid(self.bm.as_ref(), METADATA_PID);
             meta_x.ptr().root = new_root_pid;
-            self.root_pid.store(new_root_pid, std::sync::atomic::Ordering::Release);
+            self.root_pid
+                .store(new_root_pid, std::sync::atomic::Ordering::Release);
             self.validate_inner(&mut root_x)?;
             return Ok(());
         }
@@ -430,7 +466,13 @@ impl BTree {
     }
 
     /// Split an inner node inserting sep_key/right_pid; returns (separator to propagate, new inner PID).
-    fn split_inner(&self, node: &mut GuardX<BTreeNode>, sep_key: Vec<u8>, right_pid: u64, insert_pos: usize) -> Result<(Vec<u8>, u64)> {
+    fn split_inner(
+        &self,
+        node: &mut GuardX<BTreeNode>,
+        sep_key: Vec<u8>,
+        right_pid: u64,
+        insert_pos: usize,
+    ) -> Result<(Vec<u8>, u64)> {
         // Collect existing keys/children.
         let count = node.ptr().hdr.count as usize;
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(count + 1);
@@ -515,10 +557,19 @@ impl BTree {
         Ok((propagate_key, new_pid))
     }
 
-    fn leaf_entries_with(&self, node: &mut GuardX<BTreeNode>, key: &[u8], payload: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity((node.ptr().hdr.count as usize) + 1);
+    fn leaf_entries_with(
+        &self,
+        node: &mut GuardX<BTreeNode>,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity((node.ptr().hdr.count as usize) + 1);
         for i in 0..node.ptr().hdr.count as usize {
-            entries.push((node.ptr().reconstruct_key(i), node.ptr().get_payload(i).to_vec()));
+            entries.push((
+                node.ptr().reconstruct_key(i),
+                node.ptr().get_payload(i).to_vec(),
+            ));
         }
         match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
             Ok(idx) => entries[idx].1 = payload.to_vec(),
@@ -536,7 +587,11 @@ impl BTree {
         entries
     }
 
-    fn rebuild_leaf_with_entries(&self, node: &mut GuardX<BTreeNode>, entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    fn rebuild_leaf_with_entries(
+        &self,
+        node: &mut GuardX<BTreeNode>,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> bool {
         let next = node.ptr().hdr.upper_inner;
         node.ptr().hdr = super::node::BTreeNodeHeader::new(true);
         node.ptr().hdr.upper_inner = next;
@@ -556,12 +611,20 @@ impl BTree {
         true
     }
 
-    fn split_leaf_from_entries(&self, node: &mut GuardX<BTreeNode>, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(Vec<u8>, u64)> {
+    fn split_leaf_from_entries(
+        &self,
+        node: &mut GuardX<BTreeNode>,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(Vec<u8>, u64)> {
         self.validate_leaf(node)?;
         let mid = entries.len() / 2;
         let right_entries = entries[mid..].to_vec();
         let left_entries = entries[..mid].to_vec();
-        let sep_key = right_entries.first().expect("split leaf non-empty right").0.clone();
+        let sep_key = right_entries
+            .first()
+            .expect("split leaf non-empty right")
+            .0
+            .clone();
 
         let new_pid = self.bm.alloc_page()?;
         let new_ptr = self.bm.to_ptr(new_pid) as *mut BTreeNode;
@@ -607,7 +670,10 @@ impl BTree {
 impl BTree {
     pub fn debug_leaves(&self) -> Result<Vec<(u64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, u16)>> {
         let mut out = Vec::new();
-        let mut node = GuardO::<BTreeNode>::new(self.bm.as_ref(), self.root_pid.load(std::sync::atomic::Ordering::Acquire))?;
+        let mut node = GuardO::<BTreeNode>::new(
+            self.bm.as_ref(),
+            self.root_pid.load(std::sync::atomic::Ordering::Acquire),
+        )?;
         while !node.ptr().hdr.is_leaf {
             let child_pid = node.ptr().child_pid(0)?;
             node = GuardO::<BTreeNode>::new(self.bm.as_ref(), child_pid)?;
@@ -615,7 +681,9 @@ impl BTree {
         loop {
             if node.ptr().hdr.count > 0 {
                 let first = node.ptr().reconstruct_key(0);
-                let last = node.ptr().reconstruct_key((node.ptr().hdr.count - 1) as usize);
+                let last = node
+                    .ptr()
+                    .reconstruct_key((node.ptr().hdr.count - 1) as usize);
                 out.push((
                     node.pid,
                     node.ptr().lower_fence().to_vec(),

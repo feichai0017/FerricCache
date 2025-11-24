@@ -1,4 +1,4 @@
-use crate::thread_local::{set_worker_id, get_worker_id};
+use crate::thread_local::{get_worker_id, set_worker_id};
 
 #[test]
 fn worker_id_roundtrip() {

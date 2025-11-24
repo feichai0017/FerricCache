@@ -13,7 +13,7 @@ pub struct FenceKeySlot {
 #[derive(Clone)]
 pub struct BTreeNodeHeader {
     pub dirty: bool,
-    pub upper_inner: u64,      // inner: child pointer; leaf: next leaf
+    pub upper_inner: u64,          // inner: child pointer; leaf: next leaf
     pub lower_fence: FenceKeySlot, // exclusive
     pub upper_fence: FenceKeySlot, // inclusive
     pub count: u16,
@@ -161,8 +161,16 @@ impl BTreeNode {
         let upper = self.reconstruct_key((self.hdr.count - 1) as usize);
         let old_lower = self.lower_fence().to_vec();
         let old_upper = self.upper_fence().to_vec();
-        let new_lower = if old_lower.is_empty() { lower } else { old_lower };
-        let new_upper = if old_upper.is_empty() { upper } else { old_upper };
+        let new_lower = if old_lower.is_empty() {
+            lower
+        } else {
+            old_lower
+        };
+        let new_upper = if old_upper.is_empty() {
+            upper
+        } else {
+            old_upper
+        };
         self.hdr.data_offset = PAGE_SIZE as u16;
         self.hdr.space_used = 0;
         self.set_fences(&new_lower, &new_upper);
@@ -227,12 +235,7 @@ impl BTreeNode {
     pub fn get_key(&self, slot: usize) -> &[u8] {
         let s = self.get_slot(slot);
         let ptr = self as *const Self as *const u8;
-        unsafe {
-            std::slice::from_raw_parts(
-                ptr.add(s.offset as usize),
-                s.key_len as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(ptr.add(s.offset as usize), s.key_len as usize) }
     }
 
     pub fn get_payload(&self, slot: usize) -> &[u8] {
@@ -375,7 +378,8 @@ impl BTreeNode {
     }
 
     pub fn underfull(&self) -> bool {
-        self.free_space_after_compaction() + (self.hdr.space_used as usize) < BTreeNodeHeader::underfull_threshold()
+        self.free_space_after_compaction() + (self.hdr.space_used as usize)
+            < BTreeNodeHeader::underfull_threshold()
     }
 
     pub fn compactify(&mut self) {
@@ -397,7 +401,8 @@ impl BTreeNode {
     }
 
     pub fn reconstruct_key(&self, slot: usize) -> Vec<u8> {
-        let mut key = Vec::with_capacity(self.hdr.prefix_len as usize + self.get_slot(slot).key_len as usize);
+        let mut key =
+            Vec::with_capacity(self.hdr.prefix_len as usize + self.get_slot(slot).key_len as usize);
         key.extend_from_slice(self.get_prefix());
         key.extend_from_slice(self.get_key(slot));
         key
@@ -454,7 +459,11 @@ impl BTreeNode {
         unsafe {
             let dest = ptr.add(offset as usize);
             std::ptr::copy_nonoverlapping(key_tail.as_ptr(), dest, key_tail.len());
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), dest.add(key_tail.len()), payload.len());
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                dest.add(key_tail.len()),
+                payload.len(),
+            );
         }
     }
 }
@@ -473,11 +482,7 @@ fn prefix_cmp(key: &[u8], prefix: &[u8]) -> i32 {
     if let Some(c) = cmp {
         return c.signum();
     }
-    if key.len() >= prefix.len() {
-        0
-    } else {
-        -1
-    }
+    if key.len() >= prefix.len() { 0 } else { -1 }
 }
 
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {

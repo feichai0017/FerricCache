@@ -26,7 +26,9 @@ fn evict_writes_dirty_then_marks_evicted() {
     for _ in 0..64 {
         bm.evict();
         let state = bm.page_state_ref(pid).load();
-        if crate::memory::page_state::PageState::state(state) == crate::memory::page_state::state::EVICTED {
+        if crate::memory::page_state::PageState::state(state)
+            == crate::memory::page_state::state::EVICTED
+        {
             break;
         }
     }

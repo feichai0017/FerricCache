@@ -1,7 +1,7 @@
+use crate::Result;
 use crate::buffer_manager::BufferManager;
 use crate::memory::page::Page;
-use crate::memory::page_state::{state, PageState};
-use crate::Result;
+use crate::memory::page_state::{PageState, state};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
@@ -38,6 +38,7 @@ pub struct GuardO<'a, T> {
 impl<'a, T> GuardO<'a, T> {
     pub fn new(bm: &'a BufferManager, pid: u64) -> Result<Self> {
         let ps = bm.page_state_ref(pid);
+        let mut spins: u32 = 0;
         loop {
             let v = ps.load();
             match PageState::state(v) {
@@ -64,6 +65,10 @@ impl<'a, T> GuardO<'a, T> {
                 }
             }
             spin();
+            spins = spins.wrapping_add(1);
+            if spins & 0x3FF == 0 {
+                ps.wait_for_unlock(std::time::Duration::from_micros(50));
+            }
         }
     }
 
@@ -194,8 +199,6 @@ fn spin() {
         c.set(v);
         if v & 0x3FF == 0 {
             std::thread::sleep(std::time::Duration::from_nanos(50));
-        } else if v & 0x7FFF == 0 {
-            std::thread::park_timeout(std::time::Duration::from_micros(10));
         } else if v & 0x7F == 0 {
             std::thread::yield_now();
         } else {
