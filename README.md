@@ -1,139 +1,51 @@
-# FerricCache – Rust VMCache Port
+# FerricCache
 
-⚡ A Rust reimplementation of the VMCache paper (SIGMOD’23 Virtual-Memory Assisted Buffer Management), aiming for upstream semantics with safe, idiomatic code and production-grade observability.
+Rust 版 VMCache（SIGMOD’23 “Virtual-Memory Assisted Buffer Management”）实现，保持与上游 VMCache 语义一致，同时用安全的 Rust 包装、可观测性和可测性。参考上游项目：https://github.com/tuhhosg/vmcache
 
-## Why It Matters
-- VMCache shows how virtual memory primitives (mmap, madvise, exmap) can act as a high-performance buffer manager.  
-- FerricCache brings that design to Rust: safer memory/FFI boundaries, clearer ownership, testable components, and modern tooling.  
-- It can be dropped in as a buffer manager + B+tree index, or serve as a baseline for DB/benchmark experiments.
+## 快速开始
+- 依赖：Rust stable，`libaio-dev`（开启 `libaio` 功能时），Linux x86_64。
+- 构建：`cargo build --release`（默认 mmap + 同步 IO）。
+- 运行 TPCC：`RUNFOR=30 THREADS=1 DATASIZE=10 PHYSGB=4 VIRTGB=16 BGWRITE=0 cargo run --release --bin bench`
+- 运行随机读：`RNDREAD=1 DATASIZE=1e6 THREADS=8 RUNFOR=30 cargo run --release --bin bench`
+- 对齐 VMCache 输出：bench 每秒打印 `ts,tx,rmb,wmb,system,threads,datasize,workload,batch`，便于与上游 CSV 逐行对比。
 
-## Current Status
-- Buffer manager: mmap region, PageState state machine, ResidentPageSet clock eviction, mark→write→upgrade→free (sync by default), PID free list, per-thread stats/worker_id, Send/Sync sharing.
-- IO: PageIo abstraction; sync pread/pwrite default. `libaio` feature batches writes but still waits; BGWRITE has a queue + background thread with batching and saturation stats.
-- Guards: GuardO/S/X with spin/yield backoff.
-- B+tree: fences/prefix/hints; insert (split), scan, delete (borrow/merge, root shrink), duplicate overwrite; root PID via Arc<AtomicU64>, Send/Sync.
-- Bench: multi-thread random-read microbenchmark (ordered load, parallel lookups, per-thread throughput + BGWRITE stats). Main binary initializes and prints stats.
-- Tests: 19 passing unit tests (page state/eviction/batch write, B+tree CRUD+stress, BGWRITE config, worker_id, per-thread stats). `cargo test --tests --lib` green.
+## 配置（环境变量）
+- `BLOCK`：块设备或文件路径，默认 `/tmp/bm`
+- `VIRTGB`：虚拟内存大小（GB），默认 16
+- `PHYSGB`：物理缓存大小（GB），默认 4
+- `EXMAP`：非零则尝试 exmap 区域（当前若不可用会回退 mmap）
+- `BATCH`：驱逐批大小（页），默认 64
+- `RUNFOR`：基准运行时间（秒），默认 30
+- `THREADS`：线程数，默认 1
+- `DATASIZE`：TPCC 仓库数或随机读键数，默认 10
+- `RNDREAD`：非零运行随机读，否则 TPCC
+- `BGWRITE`：启用背景写，默认 0（关闭）
+- `BGW_THREADS`：背景写 worker 数，默认 1
+- `IODEPTH`：libaio 深度，默认 256
+- `IO_WORKERS`：libaio 队列数，默认 1
+- `IO_AFFINITY`：可选 CPU 亲和列表（逗号分隔），仅在 libaio 下最佳努力绑定
+- `STATS_INTERVAL_SECS`：bench 打印间隔，默认 1 秒
+- `STATS_CSV`：若设置则追加 CSV 日志（含 BGWRITE/EXMAP 信息）
 
-## VMCache Gap Snapshot
-- IO/eviction: libaio path still sync-wait; BGWRITE not fully async (inflight tracking minimal), saturation handling basic.
-- exmap: ioctl/interface pages/SEGV restart not implemented.
-- Concurrency: worker_id not bound to IO resources; no park/notify backoff.
-- B+tree: separator/fence/hint maintenance after borrow/merge can be tighter; more heavy mixed workloads needed.
-- Bench/metrics: TPCC + periodic stats thread missing; random-read output minimal vs vmcache metrics.
-- Storage/persistence: only PID free list; no segment/WAL/checkpoint (upstream also leaves this open).
+## 主要特性
+- 缓冲区管理：`PageState` 状态机，Clock 驱逐，批量写出，mmap 区域或 exmap 探测回退。
+- IO：同步 pread/pwrite；`libaio` 功能下支持多队列异步提交、队列统计、errno 分级（EAGAIN/ETIMEDOUT/EIO/ENOSPC）和重试/回退。
+- 驱逐/写出协同：BGWRITE 队列 + inflight 计数，饱和时驱逐线程 park，完成时 notify；批量/单页写并分类错误。
+- 并发：乐观/共享/独占 Guard，自旋+周期性 wait/notify，worker_id 线程局部用于 IO 队列选择。
+- B+Tree：vmcache 风格节点布局，插入/扫描/删除，借/合并，根 PID 保持。
+- 基准：TPCC 简化版与随机读，输出与 VMCache 对齐的 CSV，附带 BGWRITE/IO 队列统计。
+- 测试：覆盖 PageState、驱逐顺序、B+Tree CRUD/压力、BGWRITE 配置、worker_id 统计等。
 
-## Architecture (Target Shape)
-- `config`: env-driven knobs (`BLOCK`, `VIRTGB`, `PHYSGB`, `EXMAP`, `BATCH`, `THREADS`, `DATASIZE`, `RUNFOR`, `RNDREAD`, `BGWRITE`).
-- `memory`: `Page`, `PageState` (atomic state+version), `ResidentPageSet` (open addressing + clock), `MmapRegion`.
-- `buffer_manager`: owns region/states/resident set; fix/unfix S/X, alloc/fault, eviction with batching, IO submission, stats (global + per-thread + BGWRITE).
-- `io`: sync file IO; libaio batch pwrite (to be made truly async); future exmap path.
-- `btree`: vmcache-like node layout (prefix/fence/hints), optimistic/shared/exclusive guards, splits/merges, metadata page PID 0.
-- `bench/bin`: random-read microbenchmark (present); TPCC driver + stats thread planned.
+## 与 VMCache 的差异
+- exmap 模式：当前仅检测/回退，未接入 exmap ioctl 与 fault 处理。
+- IO/NUMA：队列选择按 worker_id 取模，亲和是最佳努力；尚未做专属队列/NUMA 绑定和优先级。
+- 锁与等待：已增加 wait/notify，但深度饥饿处理仍可优化。
+- 存储管理：无 free-space/WAL/检查点（上游也留空）。
 
-### Component Map
+## 开发提示
+- 启用 libaio：`cargo build --release --features libaio`
+- 运行测试：`cargo test`
+- 对比上游：`.vmcache_upstream/` 可直接 `make && THREADS=... ./vmcache`，与本项目 bench 同配置对比 CSV。
 
-```mermaid
-flowchart LR
-    subgraph Memory
-        PS["PageState\nAtomic state+version"]
-        RS["ResidentPageSet\nClock iterator"]
-        MR["MmapRegion\nvirtual pages"]
-    end
-    subgraph IO
-        SIO["Sync IO\npread/pwrite"]
-        LIO["Libaio (batched)\nasync planned"]
-        EX["exmap (future)"]
-    end
-    CFG["Config (env)"]
-    BM["BufferManager\nfix/unfix, eviction, stats"]
-    BT["B+Tree\nguards, split/merge"]
-    BENCH["Benches\nrandom-read, TPCC (planned)"]
-
-    CFG --> BM
-    MR --> BM
-    PS --> BM
-    RS --> BM
-    BM --> IO
-    BM <---> BT
-    IO --> SIO
-    IO --> LIO
-    IO --> EX
-    BM --> BENCH
-    BT --> BENCH
-```
-
-### Eviction / BGWRITE Pipeline (target)
-
-```mermaid
-flowchart TD
-    mark[Mark candidates] --> batch[Batch dirty pages]
-    batch --> submit{Submit write}
-    submit -->|BGWRITE on| queue[Enqueue BGWRITE]
-    submit -->|BGWRITE off| sync[Sync write_pages]
-    queue --> worker["BG worker\n(libaio async)"]
-    worker --> completion[Completion / error]
-    completion --> clean[Clear dirty, stats++]
-    sync --> clean
-    clean --> upgrade[Upgrade to X, free]
-    upgrade --> evict[Unlock as EVICTED, madvise]
-```
-
-## Roadmap (Prioritized)
-1) **IO & Eviction Parity**  
-   - Make BGWRITE truly async (bounded queue, inflight tracking, robust retries/fallback).  
-   - Harden libaio: non-blocking submit + async reap with timeout/retry; keep sync fallback.  
-   - Stress tests for batch write failures/saturation and eviction correctness.
-2) **Concurrency Model**  
-   - Wire `worker_id` into IO/exmap resources; add spin→yield→park backoff.  
-   - Extend benchmarks with per-thread throughput/hit/fault stats.
-3) **B+tree Balancing**  
-   - Refine separator/fence/hint after borrow/merge; add heavier mixed insert/delete/scan tests.
-4) **Exmap Path (feature-gated)**  
-   - ioctl + interface pages + SEGV restart strategy; graceful disable when unsupported.
-5) **Benchmarks & Metrics**  
-   - Port TPCC; add periodic stats thread (hit/miss/evict/write batches/BGWRITE/libaio queue).  
-   - Enrich random-read output (per-thread, hit-rate estimates).
-6) **Optional Storage/Persistence**  
-   - Segment/space management; WAL/checkpoint if DB semantics are desired.
-
-## Open Questions
-- Safe exmap fault handling in Rust (SEGV restart vs. pre-fault/EFAULT).
-- libaio vs. optional io_uring feature.
-- Whether to extend space management beyond PID free list (upstream leaves open).
-
-## Acceptance Targets
-- Non-exmap path passes functional tests: alloc/fault/evict, B+tree CRUD, random-read benchmark.  
-- TPCC run produces stable stats.  
-- exmap feature builds and runs on systems with the module installed.  
-- Page state invariants hold under stress (no leaked locks; resident count matches physUsedCount).
-
-## Key Behavioral Requirements to Preserve
-- Page size 4096, PID is index into `virtMem`.
-- `allocPage` increments `physUsedCount`, ensures free pages (evicts if >95% of phys), assigns PID, locks X, inserts into resident set, performs exmap alloc or marks dirty.
-- `fixX`/`fixS`:
-  - If Evicted, fault-in (read) then return.
-  - If Marked/Unlocked, attempt to lock; Shared increments count or reuses Marked->S.
-  - Yield/spin with `_mm_pause` equivalent.
-- Eviction:
-  - Clock over resident set in batches.
-  - First pass marks Unlocked pages; Marked clean -> evict candidate; Marked dirty -> try S lock, enqueue for write.
-  - Batch pwrite dirty pages; then try upgrade dirty pages to X for eviction; clean up: exmap FREE or madvise DONTNEED, remove from resident set, unlock as Evicted, decrement physUsedCount.
-- IO:
-  - Reads: pread on blockfd or exmap pread (using per-thread interface offset).
-  - Writes: libaio batch pwrite; set dirty=false before submit.
-- Concurrency:
-  - `workerThreadId` thread-local, used for exmap interface and libaio slots.
-  - OLC restarts on version mismatch or marked/evicted transitions; destructor checks enforce restart.
-  - SIGSEGV handler (exmap path) restarts if fault address is inside virtMem.
-- B+tree:
-  - Prefix compression and fences; split separator selection with optional truncation.
-  - Leaf split ordered fast path for random-read benchmark.
-  - Merge of leaves when underfull (partial, inner merge TODO in upstream).
-
-## Rust Mapping Notes
-- Atomic semantics: use `AtomicU64` with `SeqCst`/`Acquire`/`Release` mirroring C++ (explicit where needed). Preserve CAS strong/weak loops.
-- Thread-locals: `std::thread_local!` for workerThreadId.
-- Unsafe boundary: page buffer is raw mapped memory; BTree nodes overlay it via pointers. Encapsulate unsafe blocks and add debug assertions matching upstream.
-- FFI: `libc`, `libaio-sys` (or small custom bindings), and hand-written `exmap` bindings (ioctl numbers, structs, interface pages). Keep `no_std`? → No, stay in std for now.
-- Signals: Rust cannot unwind across FFI safely; prefer `sigaction` that sets a flag and longjmp-like restart or switch to pre-fault strategy in exmap mode (design decision: provide a guarded read path and handle EFAULT by restart, rather than relying on SEGV unwinding).
+## 许可
+MIT
